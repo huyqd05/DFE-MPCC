@@ -1,0 +1,58 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<root>
+ <tabbed_widget parent="main_window" name="Main Window">
+  <Tab tab_name="Telemetry: Slosh &amp; Reaction Forces" containers="1">
+   <Container>
+    <DockSplitter count="2" orientation="-" sizes="0.5;0.5">
+     <DockSplitter count="2" orientation="|" sizes="0.5;0.5">
+      <DockArea name="1. Goc Lac Nuoc theta (deg) &amp; Do Dang Song eta (mm)">
+       <plot mode="TimeSeries" style="Lines">
+        <range top="35" bottom="-25" left="0" right="30"/>
+        <limitY/>
+        <curve name="/slosh/telemetry/vector/z" color="#d62728"/>
+        <curve name="/slosh/telemetry/vector/x" color="#1f77b4"/>
+        <curve name="/slosh/telemetry/vector/y" color="#2ca02c"/>
+       </plot>
+      </DockArea>
+      <DockArea name="2. Tai Phap Tuyen 4 Banh Xe Fz (N) &amp; Fz,min > 3.0N">
+       <plot mode="TimeSeries" style="Lines">
+        <range top="25" bottom="0" left="0" right="30"/>
+        <limitY/>
+        <curve name="/amr/wheel_fz/twist/linear/z" color="#d62728"/>
+        <curve name="/amr/wheel_fz/twist/linear/x" color="#1f77b4"/>
+        <curve name="/amr/wheel_fz/twist/linear/y" color="#ff7f0e"/>
+        <curve name="/amr/wheel_fz/twist/angular/x" color="#2ca02c"/>
+        <curve name="/amr/wheel_fz/twist/angular/y" color="#9467bd"/>
+       </plot>
+      </DockArea>
+     </DockSplitter>
+     <DockSplitter count="2" orientation="|" sizes="0.5;0.5">
+      <DockArea name="3. Phan Luc Xo Day Chat Long F_slosh (N) &amp; Mo-men Lat M_roll (N.m)">
+       <plot mode="TimeSeries" style="Lines">
+        <range top="8" bottom="-8" left="0" right="30"/>
+        <limitY/>
+        <curve name="/slosh/forces/wrench/force/x" color="#d62728"/>
+        <curve name="/slosh/forces/wrench/force/y" color="#1f77b4"/>
+        <curve name="/slosh/forces/wrench/torque/x" color="#9467bd"/>
+       </plot>
+      </DockArea>
+      <DockArea name="4. Van Toc Robot v (m/s), Tran Van Toc v_ub &amp; Ma Sat San mu">
+       <plot mode="TimeSeries" style="Lines">
+        <range top="0.8" bottom="0" left="0" right="30"/>
+        <limitY/>
+        <curve name="/amr/speed_friction/vector/x" color="#2ca02c"/>
+        <curve name="/amr/speed_friction/vector/y" color="#7f7f7f"/>
+        <curve name="/amr/speed_friction/vector/z" color="#bcbd22"/>
+       </plot>
+      </DockArea>
+     </DockSplitter>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <currentTabIndex index="0"/>
+ </tabbed_widget>
+ <previouslyLoaded_Datafiles/>
+ <previouslyLoaded_Streamer name="ROS2 Topic Streamer"/>
+ <customMathEquations/>
+ <snippets/>
+</root>

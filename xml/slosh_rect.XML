@@ -1,0 +1,164 @@
+<mujoco model="diy_agv_rect_tank_dual_pendulum_cbf_lidar_yaw">
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+    <visual>
+        <global offwidth="640" offheight="480"/>
+        <map znear="0.003" zfar="8"/>
+    </visual>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .2 .3" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="20 20" reflectance="0.2"/>
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Floor 8x8 m -->
+        <geom name="ground" type="plane" size="4 4 0.1" material="gridmat"/>
+
+        <!-- ================================================================
+             MAP. Everything the LiDAR should "see" is in geom group 1
+             (the Python LiDAR only ray-casts against group 1, so it never
+             hits the cart, the floor or the start/goal markers). All are
+             1.0 m tall, above the lidar scan plane (world z = 0.36 m).
+             ================================================================ -->
+
+        <!-- START / GOAL markers (group 2 = invisible to the lidar).
+             Python reads these positions, so just move them to change the trip. -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.18 0.004" pos="-2.0 -2.0 0.004" rgba="0.2 0.4 1 0.7" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.18 0.004" pos="2.0 2.0 0.004"   rgba="0.1 0.9 0.2 0.7" contype="0" conaffinity="0"/>
+
+        <!-- Outer boundary walls: 5.1 x 5.1 m free area (inner faces at +-2.55) -->
+        <geom name="wall_n" group="1" type="box" size="2.65 0.05 0.5" pos="0 2.6 0.5"  rgba="0.6 0.6 0.6 1"/>
+        <geom name="wall_s" group="1" type="box" size="2.65 0.05 0.5" pos="0 -2.6 0.5" rgba="0.6 0.6 0.6 1"/>
+        <geom name="wall_e" group="1" type="box" size="0.05 2.65 0.5" pos="2.6 0 0.5"  rgba="0.6 0.6 0.6 1"/>
+        <geom name="wall_w" group="1" type="box" size="0.05 2.65 0.5" pos="-2.6 0 0.5" rgba="0.6 0.6 0.6 1"/>
+
+        <!-- ================================================================
+             TEST 1 BENCHMARK MAP: S-Curve / Chicane Resonance Track
+             Khoảng cách giữa các vách đổi chiều liên tiếp: Delta_y = 0.65 m.
+             Với vận tốc xe v ~ 1.1 m/s, chu kỳ kích thích giữa 2 khúc cua ngược chiều
+             là Delta_t = 0.65 / 1.1 ~ 0.54 s, TRÙNG KHỚP với chu kỳ riêng sóng sánh
+             T_x = 2*pi / 11.89 ~ 0.53 s, tạo hiện tượng CỘNG HƯỞNG CÙNG PHA dữ dội.
+             ================================================================ -->
+
+        <!-- Long dividing walls. wall_1 (y -2.55..1.35), wall_2 (y -1.35..2.55) -->
+        <geom name="wall_1" group="1" type="box" size="0.05 1.95 0.5" pos="-0.8 -0.6 0.5" rgba="0.7 0.7 0.7 1"/>
+        <geom name="wall_2" group="1" type="box" size="0.05 1.95 0.5" pos="0.8 0.6 0.5"   rgba="0.7 0.7 0.7 1"/>
+
+        <!-- Chuỗi Chicane Lane A: 4 vách ngăn so le cách nhau đúng 0.65 m -->
+        <geom name="baffle_A1" group="1" type="box" size="0.25 0.05 0.5" pos="-2.30 -1.30 0.5" rgba="0.9 0.3 0.2 1"/>
+        <geom name="baffle_A2" group="1" type="box" size="0.25 0.05 0.5" pos="-1.05 -0.65 0.5" rgba="0.9 0.7 0.2 1"/>
+        <geom name="baffle_A3" group="1" type="box" size="0.25 0.05 0.5" pos="-2.30  0.00 0.5" rgba="0.9 0.3 0.2 1"/>
+        <geom name="baffle_A4" group="1" type="box" size="0.25 0.05 0.5" pos="-1.05  0.65 0.5" rgba="0.9 0.7 0.2 1"/>
+
+        <!-- Lane B baffles (1.2 m gap) -->
+        <geom name="baffle_B1" group="1" type="box" size="0.15 0.05 0.5" pos="0.60 0.90 0.5"  rgba="0.8 0.5 0.1 1"/>
+        <geom name="baffle_B2" group="1" type="box" size="0.15 0.05 0.5" pos="-0.60 -0.30 0.5" rgba="0.8 0.5 0.1 1"/>
+
+        <!-- Lane C baffles (1.2 m gap) -->
+        <geom name="baffle_C1" group="1" type="box" size="0.25 0.05 0.5" pos="2.30 -0.30 0.5" rgba="0.9 0.7 0.2 1"/>
+        <geom name="baffle_C2" group="1" type="box" size="0.25 0.05 0.5" pos="1.10 0.90 0.5"  rgba="0.9 0.7 0.2 1"/>
+
+        <!-- CART FRAME (3 kg) -->
+        <body name="cart" pos="0 0 0.06">
+            <inertial pos="0 0 0" mass="3.0" diaginertia="0.02 0.02 0.02"/>
+
+            <!-- Slides stay in the world frame; the yaw hinge rotates everything below it. -->
+            <joint name="slide_x" type="slide" axis="1 0 0" damping="1.5" frictionloss="0.5"/>
+            <joint name="slide_y" type="slide" axis="0 1 0" damping="1.5" frictionloss="0.5"/>
+            <joint name="yaw" type="hinge" axis="0 0 1" damping="0.05" frictionloss="0.02"/>
+
+            <!-- 2D LiDAR: puck + scan-origin site (cart frame z = 0.30) -->
+            <geom name="lidar_puck" type="cylinder" size="0.04 0.03" pos="0 0 0.28" rgba="0.1 0.1 0.1 1" contype="0" conaffinity="0"/>
+            <site name="lidar_site" pos="0 0 0.30" size="0.01" rgba="1 0 0 1"/>
+
+            <geom type="box" size="0.15 0.10 0.01" pos="0 0 0" rgba="0.8 0.8 0.8 0.9" contype="0" conaffinity="0"/>
+
+            <!-- Heading marker (front of the cart = +x in the body frame) -->
+            <geom name="heading_nose" type="box" size="0.03 0.02 0.01" pos="0.14 0 0.02" rgba="1 0.2 0.2 1" contype="0" conaffinity="0"/>
+
+            <!-- SURROUND-VIEW CAMERAS (unused by the controller) -->
+            <camera name="cam_front" pos="0.17 0 0.30" xyaxes="0 -1 0 0 0 1" fovy="75"/>
+            <camera name="cam_left"  pos="0 0.17 0.30" xyaxes="1 0 0 0 0 1"  fovy="75"/>
+            <camera name="cam_back"  pos="-0.17 0 0.30" xyaxes="0 1 0 0 0 1" fovy="75"/>
+            <camera name="cam_right" pos="0 -0.17 0.30" xyaxes="-1 0 0 0 0 1" fovy="75"/>
+
+            <!-- 4 wheels -->
+            <geom type="cylinder" size="0.04 0.02" pos="0.1 0.12 -0.02" euler="1.5708 0 0" rgba="0.2 0.2 0.2 1" contype="0" conaffinity="0"/>
+            <geom type="cylinder" size="0.04 0.02" pos="0.1 -0.12 -0.02" euler="1.5708 0 0" rgba="0.2 0.2 0.2 1" contype="0" conaffinity="0"/>
+            <geom type="cylinder" size="0.04 0.02" pos="-0.1 0.12 -0.02" euler="1.5708 0 0" rgba="0.2 0.2 0.2 1" contype="0" conaffinity="0"/>
+            <geom type="cylinder" size="0.04 0.02" pos="-0.1 -0.12 -0.02" euler="1.5708 0 0" rgba="0.2 0.2 0.2 1" contype="0" conaffinity="0"/>
+
+            <!-- ============================================================
+                 RECTANGULAR ACRYLIC TANK
+                   inner size  0.20 m (x, long) x 0.10 m (y, short) x 0.10 m water depth = 2.0 kg water.
+                 Linear potential-flow slosh theory (rectangular tank, length l along the motion direction,
+                 depth h, first antisymmetric mode):
+                   w1^2 = (g*pi/l) * tanh(pi*h/l)
+                   m1/m = 8*tanh(pi*h/l) / (pi^2 * (pi*h/l))
+                 x motion (l=0.20): w1 = 11.89 rad/s, m1 = 0.947 kg -> pendulum length Lx = g/w1^2 = 0.0694 m
+                 y motion (l=0.10): w1 = 17.52 rad/s, m1 = 0.514 kg -> pendulum length Ly = g/w1^2 = 0.0320 m
+                 Rigid mass = tank walls 0.3 kg + water that does not slosh (2.0 - 0.947 - 0.514 = 0.539 kg) = 0.839 kg.
+
+                 DUAL-MASS TRAMMEL-STYLE PENDULUM: one mass swinging only in the x-z plane (hinge about y)
+                 and one swinging only in the y-z plane (hinge about x). Two perpendicular planes, two
+                 different lengths -> different slosh frequencies along the long and short side of the tank.
+                 ============================================================ -->
+            <body name="container" pos="0 0 0.01">
+                <inertial pos="0 0 0.05" mass="0.839" diaginertia="0.01 0.01 0.01"/>
+
+                <geom type="box" size="0.104 0.054 0.002" pos="0 0 0" rgba="0.5 0.8 1 0.2" contype="0" conaffinity="0"/>
+                <!-- Thành trước & sau (dài 200mm, cao 170mm: mực nước 100mm, mép thành tự do Freeboard = 70mm) -->
+                <geom type="box" size="0.104 0.002 0.085" pos="0 -0.052 0.085" rgba="0.5 0.8 1 0.2" contype="0" conaffinity="0"/>
+                <geom type="box" size="0.104 0.002 0.085" pos="0 0.052 0.085" rgba="0.5 0.8 1 0.2" contype="0" conaffinity="0"/>
+                <!-- Thành trái & phải (rộng 100mm, cao 170mm: mực nước 100mm, mép thành tự do Freeboard = 70mm) -->
+                <geom type="box" size="0.002 0.054 0.085" pos="-0.102 0 0.085" rgba="0.5 0.8 1 0.2" contype="0" conaffinity="0"/>
+                <geom type="box" size="0.002 0.054 0.085" pos="0.102 0 0.085" rgba="0.5 0.8 1 0.2" contype="0" conaffinity="0"/>
+
+                <!-- Water volume (visual only) -->
+                <geom type="box" size="0.098 0.048 0.05" pos="0 0 0.05" rgba="0 0.5 1 0.25" contype="0" conaffinity="0"/>
+
+                <!-- x-direction slosh pendulum: swings in x-z (hinge axis y), pivot at the free surface (z = 0.10) -->
+                <body name="slosh_x_pivot" pos="0 0 0.10">
+                    <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+                    <joint name="slosh_x" type="hinge" axis="0 1 0" damping="0.0016"/>
+
+                    <geom type="box" size="0.098 0.048 0.003" pos="0 0 0" rgba="0 0.5 1 0.5" contype="0" conaffinity="0"/>
+                    <geom type="cylinder" size="0.002 0.0347" pos="0 0 -0.0347" rgba="0.8 0.8 0.8 1" contype="0" conaffinity="0"/>
+
+                    <body name="slosh_x_mass" pos="0 0 -0.0694">
+                        <inertial pos="0 0 0" mass="0.947" diaginertia="1e-7 1e-7 1e-7"/>
+                        <geom type="sphere" size="0.014" rgba="1 0 0 1" contype="0" conaffinity="0"/>
+                    </body>
+                </body>
+
+                <!-- y-direction slosh pendulum: swings in y-z (hinge axis x), pivot at the free surface (z = 0.10) -->
+                <body name="slosh_y_pivot" pos="0 0 0.10">
+                    <inertial pos="0 0 0" mass="0.001" diaginertia="1e-7 1e-7 1e-7"/>
+                    <site name="pivot_site" pos="0 0 0" size="0.01" rgba="1 0 0 0"/>
+                    <joint name="slosh_y" type="hinge" axis="1 0 0" damping="0.00028"/>
+
+                    <geom type="cylinder" size="0.002 0.016" pos="0 0 -0.016" rgba="0.8 0.8 0.8 1" contype="0" conaffinity="0"/>
+
+                    <body name="slosh_y_mass" pos="0 0 -0.0320">
+                        <inertial pos="0 0 0" mass="0.514" diaginertia="1e-7 1e-7 1e-7"/>
+                        <geom type="sphere" size="0.011" rgba="0.2 0.2 1 1" contype="0" conaffinity="0"/>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <sensor>
+        <force name="fluid_force" site="pivot_site"/>
+    </sensor>
+
+    <!-- ctrl[0]=Fx, ctrl[1]=Fy, ctrl[2]=yaw torque -->
+    <actuator>
+        <motor joint="slide_x" name="force_x" gear="1"/>
+        <motor joint="slide_y" name="force_y" gear="1"/>
+        <motor joint="yaw" name="torque_yaw" gear="1" ctrllimited="true" ctrlrange="-1 1"/>
+    </actuator>
+</mujoco>

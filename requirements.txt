@@ -1,0 +1,9 @@
+# Core Python dependencies for DFE-MPCC AMR simulation, CasADi NMPC, and WCSPH/CFD validation
+numpy
+scipy
+casadi
+mujoco
+matplotlib
+
+# Optional ROS 2 Jazzy SiL dependencies (installed via ROS 2 system environment / apt):
+# rclpy, tf2_ros, geometry_msgs, nav_msgs, sensor_msgs, std_msgs, visualization_msgs

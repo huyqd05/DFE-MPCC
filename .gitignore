@@ -1,0 +1,133 @@
+# ==========================================
+# 1. BÁO CÁO, TÀI LIỆU VĂN PHÒNG & FILE DUMP
+# ==========================================
+# Thư mục báo cáo
+bao cao/
+[Bb]ao [Cc]ao/
+
+# Tài liệu Microsoft Office & PDF
+*.docx
+*.doc
+*.docm
+*.pptx
+*.ppt
+*.xlsx
+*.xls
+*.pdf
+
+# File văn bản xuất dữ liệu tạm (dump / log)
+dump_*.txt
+*_dump.txt
+test_suite_output.txt
+
+# ==========================================
+# 2. HÌNH ẢNH, SCREENSHOT & MEDIA
+# ==========================================
+# Thư mục ảnh test
+pictest/
+
+# Các định dạng hình ảnh & video
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+*.ico
+*.mp4
+*.avi
+
+# ==========================================
+# 3. KẾT QUẢ BENCHMARK & BỘ NHỚ ĐỆM DỮ LIỆU
+# ==========================================
+# Thư mục kết quả benchmark sinh ra
+testbm/
+cache/
+
+# Dữ liệu ma trận lớn & cache
+*.npz
+*.npy
+*.mat
+*.pkl
+
+# Các file kết quả benchmark json ở thư mục gốc
+benchmark_*_full_results.json
+test_*_seeds.json
+
+# ==========================================
+# 4. MÔI TRƯỜNG ẢO & BỘ BIÊN DỊCH PYTHON
+# ==========================================
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# 5. IDE, EDITOR & THƯ MỤC TẠM
+# ==========================================
+.vscode/
+.idea/
+.pytest_cache/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+*.log
+New folder/
+tools/
+scratch/
+
+# ==========================================
+# 6. AGENT TOOLS & TÀI LIỆU NỘI BỘ
+# ==========================================
+.agents/
+human-skill/
+AGENTS.md
+Huong_Dan_Sua_Code_Chi_Tiet_SIMPAT.md
+
+# ==========================================
+# 7. MONTE CARLO, LEGACY PROTOTYPES & DEV SCRATCH
+# ==========================================
+# Kho lưu trữ Monte Carlo 50-seed cũ
+_frozen_legacy_monte_carlo/
+
+# Script benchmark Monte Carlo 30-seed & dashboard cũ
+simulation/run_30_seeds_benchmark_experiment.py
+simulation/run_parallel_30_seeds.py
+simulation/summarize_results.py
+simulation/generate_5_groups_dashboard.py
+
+# Launcher & file cấu hình bản cũ (8-DoF / legacy)
+active_map.txt
+run.bat
+run.ps1
+simulation/test.py
+simulation/test_sim_closed_loop.py
+controller/NMPC.py
+controller/NMPC2.py
+controller/NMPC4.py
+controller/mpcc_nmpc_controller.py
+solver/acados_model.c
+solver/acados_model.h
+solver/robot_kinematics.c
+solver/robot_kinematics_casadi.py
+solver/robot_model_casadi.py
+xml/slosh2.XML
+xml/slosh4.xml
+xml/slosh4_backup.xml
+
+# File phát triển/thử nghiệm tạm trong module CFD
+cfd/scratch_*.py
+cfd/clean_wcsph.py
+cfd/test_clean_run.py
+cfd/test_cm_formulation.py
+cfd/test_filter_results.py
+cfd/test_robust_run.py
+cfd/test_roll_and_damping.py
+cfd/export_sph_animation.py
+cfd/build_visualizer_html.py
+

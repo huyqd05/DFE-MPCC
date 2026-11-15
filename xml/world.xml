@@ -1,0 +1,93 @@
+<mujoco model="diy_arena_map_world">
+    <!-- ============================================================================= -->
+    <!-- WORLD.XML: BẢN ĐỒ MÔ PHỎNG MÊ CUNG MỚI (CHICANE ARENA VARIANT)                -->
+    <!-- Kích thước: Sàn 8x8m, Đấu trường 6x6m, 18 Chướng ngại vật (Tường + Trụ + Thùng)  -->
+    <!-- Đã tinh chỉnh tối ưu hóa bán kính lượn cua, độ rộng khe hẹp và bổ sung vật cản -->
+    <!-- ============================================================================= -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .2 .3" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="20 20" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.6 0.6 0.65 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Sàn đấu trường 8x8 m -->
+        <geom name="ground" type="plane" size="4 4 0.1" material="gridmat"/>
+
+        <!-- ĐIỂM XUẤT PHÁT VÀ ĐÍCH ĐẾN (START / GOAL MARKERS) -->
+        <!-- Start: [-2.2, -2.2], Goal: [2.2, 2.2] -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.22 0.004" pos="-2.2 -2.2 0.004" rgba="0.2 0.4 1 0.7" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.22 0.004" pos="2.2 2.2 0.004"   rgba="0.1 0.9 0.2 0.7" contype="0" conaffinity="0"/>
+
+        <!-- ================================================================= -->
+        <!-- 1. TƯỜNG BAO NGOÀI ĐẤU TRƯỜNG (OUTER BOUNDARY WALLS - 6x6 M)     -->
+        <!-- ================================================================= -->
+        <geom class="wall" name="wall_n" size="3.05 0.05 0.5" pos="0 3.0 0.5"/>
+        <geom class="wall" name="wall_s" size="3.05 0.05 0.5" pos="0 -3.0 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.05 0.5" pos="3.0 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.05 0.5" pos="-3.0 0 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 2. HỆ THỐNG TƯỜNG NGĂN CHICANE (INTERIOR CHICANE WALLS)           -->
+        <!-- ================================================================= -->
+        <!-- Wall 1: x = -1.0, kéo dài từ Nam lên gần Bắc (hở ngách Bắc 2.2m) -->
+        <geom class="wall" name="wall_1" size="0.05 1.875 0.5" pos="-1.0 -1.075 0.5"/>
+        
+        <!-- Wall 2: x = +1.0, kéo dài từ Bắc xuống gần Nam (hở ngách Nam 2.2m) -->
+        <geom class="wall" name="wall_2" size="0.05 1.875 0.5" pos="1.0 1.075 0.5"/>
+        
+        <!-- Wall Mid (Tinh chỉnh): Dời nhẹ lên y = 0.20, ngắn hơn 5cm giúp khe hẹp bên trái rộng 1.25m -->
+        <geom class="wall" name="wall_mid" size="0.35 0.05 0.5" pos="0.60 0.20 0.5"/>
+        
+        <!-- Wall Stub (Tinh chỉnh): Dời xuống y = -0.35m giúp khúc cua phía Đông thoáng hơn -->
+        <geom class="wall" name="wall_stub" size="0.45 0.05 0.5" pos="2.45 -0.35 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 3. CHƯỚNG NGẠI VẬT KHU TÂY (WEST ZONE - KHỞI HÀNH)                -->
+        <!-- ================================================================= -->
+        <!-- Trụ đỏ (Tinh chỉnh): Dời pos=(-2.30, -0.70), bán kính R=0.28m tạo đà xuất phát êm -->
+        <geom class="obs" name="obs_red"  type="cylinder" size="0.28 0.5" pos="-2.30 -0.70 0.5" rgba="0.85 0.2 0.2 1"/>
+        <!-- Thùng vàng A (Tinh chỉnh): Dời sang pos=(-1.55, -1.65), cách góc cua 15cm tránh điểm mù -->
+        <geom class="obs" name="crate_a"  type="box" size="0.18 0.18 0.5" pos="-1.55 -1.65 0.5" rgba="0.9 0.7 0.2 1"/>
+        <!-- Trụ xanh dương: pos=(-1.50, 1.80), bán kính R=0.32m chặn ngách trên -->
+        <geom class="obs" name="obs_blue" type="cylinder" size="0.32 0.5" pos="-1.50 1.80 0.5" rgba="0.2 0.3 0.85 1"/>
+
+        <!-- ================================================================= -->
+        <!-- 4. CHƯỚNG NGẠI VẬT KHU GIỮA (MID ZONE - HÀNH LANG CHICANE)        -->
+        <!-- ================================================================= -->
+        <!-- Trụ tím (Tinh chỉnh): Dời nhẹ vào pos=(0.25, 2.05), thử thách tránh va chạm đỉnh góc -->
+        <geom class="obs" name="obs_purple" type="cylinder" size="0.26 0.5" pos="0.25 2.05 0.5" rgba="0.65 0.2 0.8 1"/>
+        <!-- Thùng cam B (Tinh chỉnh): Dời xuống pos=(0.40, -0.65), size=(0.20x0.18m) tối ưu luồng đi -->
+        <geom class="obs" name="crate_b"    type="box" size="0.20 0.18 0.5" pos="0.40 -0.65 0.5" rgba="0.8 0.5 0.15 1"/>
+        <!-- Trụ vàng: pos=(-0.40, -1.90), bán kính R=0.28m cản ngõ rẽ dưới -->
+        <geom class="obs" name="obs_yellow" type="cylinder" size="0.28 0.5" pos="-0.40 -1.90 0.5" rgba="0.9 0.85 0.1 1"/>
+
+        <!-- ================================================================= -->
+        <!-- 5. CHƯỚNG NGẠI VẬT KHU ĐÔNG (EAST ZONE - TĂNG TỐC VỀ ĐÍCH)        -->
+        <!-- ================================================================= -->
+        <!-- Thùng nâu C (Tinh chỉnh): pos=(1.40, -1.50), size=(0.18x0.20m) -->
+        <geom class="obs" name="crate_c"  type="box" size="0.18 0.20 0.5" pos="1.20 -1.50 0.5" rgba="0.6 0.4 0.2 1"/>
+        <!-- Thùng sồi E : pos=(2.25, -1.35), size=(0.15x0.15m) tăng độ phức tạp vùng ngách Đông -->
+        <geom class="obs" name="crate_e"  type="box" size="0.15 0.15 0.5" pos="2.25 -1.35 0.5" rgba="0.7 0.45 0.25 1"/>
+        <!-- Trụ xanh lá (Tinh chỉnh): pos=(2.40, 0.85), bán kính R=0.28m thử thách bám vách cua phải -->
+        <geom class="obs" name="obs_green" type="cylinder" size="0.28 0.5" pos="2.40 0.85 0.5" rgba="0.2 0.75 0.25 1"/>
+        <!-- Thùng khaki D: pos=(1.50, 1.90), size=(0.18x0.18m) tạo hành lang hẹp dẫn tới điểm Goal -->
+        <geom class="obs" name="crate_d"  type="box" size="0.18 0.18 0.5" pos="1.50 1.90 0.5" rgba="0.75 0.6 0.3 1"/>
+    </worldbody>
+</mujoco>

@@ -1,0 +1,75 @@
+<mujoco model="diy_arena_map_world">
+    <!-- WORLD.XML: MEO CUNG CHICANE - PHIEN BAN TUONG PHUC TAP, IT VAT CAN -->
+    <!-- San 8x8m, dau truong 6x6m, 15 vach tuong trong + 4 vat can roi -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .2 .3" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="20 20" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.6 0.6 0.65 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="1 1 1"/>
+        <geom name="ground" type="plane" size="4 4 0.1" material="gridmat"/>
+        <!-- Start: [-2.2, -2.2], Goal: [2.2, 2.2] -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.22 0.004" pos="-2.2 -2.2 0.004" rgba="0.2 0.4 1 0.7" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.22 0.004" pos="2.2 2.2 0.004"   rgba="0.1 0.9 0.2 0.7" contype="0" conaffinity="0"/>
+
+        <!-- TUONG BAO NGOAI 6x6 m -->
+        <geom class="wall" name="wall_n" size="3.05 0.05 0.5" pos="0 3.0 0.5"/>
+        <geom class="wall" name="wall_s" size="3.05 0.05 0.5" pos="0 -3.0 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.05 0.5" pos="3.0 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.05 0.5" pos="-3.0 0 0.5"/>
+
+        <!-- TUONG NGAN BEN TRONG -->
+        <!-- Vach doc x=-1.0, tu Nam len gan Bac -->
+        <geom class="wall" name="wall_1" size="0.050 1.875 0.5" pos="-1.000 -1.075 0.5"/>
+        <!-- Vach doc x=+1.0, tu Bac xuong gan Nam -->
+        <geom class="wall" name="wall_2" size="0.050 1.875 0.5" pos="1.000 1.075 0.5"/>
+        <!-- Vach ngan giua, gan vao wall_2 -->
+        <geom class="wall" name="wall_mid" size="0.350 0.050 0.5" pos="0.600 0.200 0.5"/>
+        <!-- Vach cut phia Dong -->
+        <geom class="wall" name="wall_stub" size="0.450 0.050 0.5" pos="2.450 -0.350 0.5"/>
+        <!-- Chan A: gan tuong Tay, chua khe phia Dong (0.8m) -->
+        <geom class="wall" name="wall_w1" size="0.550 0.050 0.5" pos="-2.400 -1.200 0.5"/>
+        <!-- Chan B: gan wall_1, chua khe phia Tay (0.9m) -->
+        <geom class="wall" name="wall_w2" size="0.500 0.050 0.5" pos="-1.550 0.100 0.5"/>
+        <!-- Ngach cut (dead-end) goc Tay-Bac -->
+        <geom class="wall" name="wall_w3" size="0.600 0.050 0.5" pos="-2.350 1.900 0.5"/>
+        <!-- Mong cau chu L cho ngach cut -->
+        <geom class="wall" name="wall_w4" size="0.050 0.275 0.5" pos="-1.750 2.175 0.5"/>
+        <!-- Chan gan wall_1, khe phia Phai (1.05m) -->
+        <geom class="wall" name="wall_m1" size="0.425 0.050 0.5" pos="-0.525 -0.900 0.5"/>
+        <!-- Chan gan wall_2, khe phia Trai (1.1m) -->
+        <geom class="wall" name="wall_m2" size="0.400 0.050 0.5" pos="0.550 1.700 0.5"/>
+        <!-- Vach ngan treo tu tuong Bac, tao ngach cut -->
+        <geom class="wall" name="wall_m3" size="0.050 0.475 0.5" pos="-0.200 2.475 0.5"/>
+        <!-- Tiep noi wall_2 phia duoi, khe thoat Dong y=-2.0..-0.8 -->
+        <geom class="wall" name="wall_2b" size="0.050 0.475 0.5" pos="1.000 -2.475 0.5"/>
+        <!-- Chan gan wall_2, khe phia Dong (1.0m) -->
+        <geom class="wall" name="wall_e1" size="0.450 0.050 0.5" pos="1.500 0.600 0.5"/>
+        <!-- Chan gan tuong Dong, khe phia Tay (0.9m) -->
+        <geom class="wall" name="wall_e2" size="0.500 0.050 0.5" pos="2.450 1.700 0.5"/>
+        <!-- Ngach cut gan Dich -->
+        <geom class="wall" name="wall_e3" size="0.050 0.250 0.5" pos="1.550 2.700 0.5"/>
+
+        <!-- VAT CAN ROI -->
+        <geom class="obs" name="obs_red" type="cylinder" size="0.28 0.5" pos="-1.50 -2.30 0.5" rgba="0.85 0.2 0.2 1"/>
+        <geom class="obs" name="obs_yellow" type="cylinder" size="0.28 0.5" pos="0.20 -1.40 0.5" rgba="0.9 0.85 0.1 1"/>
+        <geom class="obs" name="crate_c" type="box" size="0.18 0.18 0.5" pos="2.30 -1.55 0.5" rgba="0.6 0.4 0.2 1"/>
+        <geom class="obs" name="crate_d" type="box" size="0.18 0.18 0.5" pos="2.65 2.65 0.5" rgba="0.75 0.6 0.3 1"/>
+    </worldbody>
+</mujoco>

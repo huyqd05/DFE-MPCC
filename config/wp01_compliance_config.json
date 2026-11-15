@@ -1,0 +1,75 @@
+{
+  "_description": "Cấu hình chuẩn kiểm toán kỹ thuật mô hình vật lý và động lực học xe AMR Mecanum - Gói WP 01",
+  "_version": "1.0.0",
+  "vehicle_geometry": {
+    "L_x": 0.12,
+    "L_y": 0.14,
+    "L_sum": 0.26,
+    "R_w": 0.04,
+    "robot_radius": 0.35,
+    "gravity": 9.81
+  },
+  "mass_breakdown": {
+    "M_cart": 5.500,
+    "M_shell": 0.550,
+    "M_liquid": 1.200,
+    "M_total": 7.250
+  },
+  "elevations": {
+    "Z_cart": 0.040,
+    "Z_floor": 0.052,
+    "Z_com": 0.0555,
+    "Z_com_comment": "Trích xuất trực tiếp từ data.subtree_com[0] tại phi=0 trong MuJoCo (0.05549 m ≈ 0.0555 m)",
+    "Z_slosh_x": 0.1178,
+    "Z_slosh_y": 0.1101,
+    "Z_slosh_nominal": 0.1140
+  },
+  "water_level_pendulum": {
+    "h40": {
+      "liquid_height": 0.040,
+      "m_liquid": 0.600,
+      "m_1x": 0.3386,
+      "l_px": 0.0384,
+      "omega_x": 15.98,
+      "m_1y": 0.2085,
+      "l_py": 0.0189,
+      "omega_y": 22.78
+    },
+    "h60": {
+      "liquid_height": 0.060,
+      "m_liquid": 0.900,
+      "m_1x": 0.4682,
+      "l_px": 0.0471,
+      "omega_x": 14.43,
+      "m_1y": 0.3082,
+      "l_py": 0.0267,
+      "omega_y": 19.16
+    },
+    "h80": {
+      "liquid_height": 0.080,
+      "m_liquid": 1.200,
+      "m_1x": 0.5412,
+      "l_px": 0.0512,
+      "omega_x": 13.84,
+      "m_1y": 0.3820,
+      "l_py": 0.0323,
+      "omega_y": 17.44
+    }
+  },
+  "acceptance_thresholds": {
+    "test1_fz_err_max": 1e-12,
+    "test1_sum_err_max": 1e-12,
+    "test2_pure_braking_fz_sum_err": 1e-12,
+    "test3_pure_steer_fz_sum_err": 1e-12,
+    "test4_mass_conservation_tol": 1e-12,
+    "test5_xml_mass_tol": 1e-4,
+    "test6_tilt_angle_err_tol_rad": 0.005,
+    "test7_actuator_wrench_tol": 1e-12,
+    "test8_r2_min": 0.980,
+    "test8_rmse_max_deg": 1.00,
+    "test8_max_err_deg": 3.00,
+    "test9_facet_violation_tol": 0.0,
+    "test9_boundary_tightness_tol": 1e-12,
+    "test9_lp_match_pct_min": 100.0
+  }
+}

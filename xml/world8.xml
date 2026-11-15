@@ -1,0 +1,77 @@
+<mujoco model="diy_arena_map_world8_extreme_multi_choke_warehouse">
+    <!-- ============================================================================= -->
+    <!-- WORLD8.XML: ĐẤU TRƯỜNG KHO VẬN ĐA HÀNH LANG PHỨC HỢP (6.5 x 6.5 M)            -->
+    <!-- "Extreme Multi-Choke Logistics Warehouse Arena (Uniform Friction mu = 0.35)"   -->
+    <!-- Thiết kế để đối chứng 2 cấu hình DFE-MPCC:                                    -->
+    <!--   (1) DFE-MPCC Không Checkpoint : ROM cơ sở, chưa chuẩn hóa WCSPH/Conformal   -->
+    <!--   (2) DFE-MPCC Có Checkpoint    : Tích hợp Ống vận tốc KM + Checkpoint WCSPH  -->
+    <!-- Đặc điểm địa hình:                                                            -->
+    <!--   - 4 khúc cua gắt liên hoàn (2 cua quay đầu 180° + 2 cua vuông 90° + chicane)   -->
+    <!--   - Mặt sàn phẳng ma sát đồng nhất mu = 0.35 + mấp mô ISO 8608 Class B          -->
+    <!--   - Chiều dài quỹ đạo A* L ~ 14.2 - 15.0 m với 4 vật cản động tuần tra cắt ngang  -->
+    <!-- ============================================================================= -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".16 .22 .32" rgb2=".08 .14 .22" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="22 22" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.50 0.55 0.65 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="dyn_obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 5" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Sàn đấu trường 8.5 x 8.5 m -->
+        <geom name="ground" type="plane" size="4.25 4.25 0.1" material="gridmat"/>
+
+        <!-- ĐIỂM XUẤT PHÁT VÀ ĐÍCH ĐẾN (START / GOAL MARKERS) -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.24 0.004" pos="-2.40 -2.40 0.004" rgba="0.2 0.4 1 0.75" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.24 0.004" pos="2.40 2.40 0.004"   rgba="0.1 0.9 0.2 0.75" contype="0" conaffinity="0"/>
+
+        <!-- Sàn phẳng đồng nhất mu = 0.35 (đã tạm ẩn các thảm bẫy ma sát để tách bạch kiểm chứng Checkpoint) -->
+
+        <!-- ================================================================= -->
+        <!-- 1. TƯỜNG BAO NGOÀI ĐẤU TRƯỜNG (OUTER BOUNDARY WALLS - 6.5 x 6.5 M)-->
+        <!-- ================================================================= -->
+        <geom class="wall" name="wall_n" size="3.30 0.05 0.5" pos="0 3.25 0.5"/>
+        <geom class="wall" name="wall_s" size="3.30 0.05 0.5" pos="0 -3.25 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.30 0.5" pos="3.25 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.30 0.5" pos="-3.25 0 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 2. HỆ THỐNG 6 VÁCH TƯỜNG TẠO 5 HÀNH LANG KHO VẬN PHỨC HỢP CỰC HẠN -->
+        <!-- ================================================================= -->
+        <!-- Vách tường 1 (Dọc Tây - từ y=-3.25 lên y=+1.55 tại x=-1.60): tạo hành lang 1 -->
+        <geom class="wall" name="wall_1" size="0.04 2.40 0.5" pos="-1.60 -0.85 0.5"/>
+
+        <!-- Vách tường 1b (Chicane nhô Tây tại x=-2.90..-2.45, y=-0.50): tạo nhịp đảo hướng S -->
+        <geom class="wall" name="wall_1_fin" size="0.35 0.04 0.5" pos="-2.85 -0.50 0.5"/>
+
+        <!-- Vách tường 2 (Dọc Trung-Tây - từ y=+3.25 xuống y=-1.55 tại x=-0.10): bắt buộc cua 180° -->
+        <geom class="wall" name="wall_2" size="0.04 2.40 0.5" pos="-0.10 0.85 0.5"/>
+
+        <!-- Vách tường 2b (Chicane Trung tâm nhô ngang tại x=-0.90..-0.10, y=0.30) -->
+        <geom class="wall" name="wall_2_fin" size="0.38 0.04 0.5" pos="-0.50 0.30 0.5"/>
+
+        <!-- Vách tường 3 (Dọc Trung-Đông - từ y=-3.25 lên y=+1.20 tại x=+1.40): bắt buộc cua 180° thứ hai -->
+        <geom class="wall" name="wall_3" size="0.04 2.225 0.5" pos="1.40 -1.025 0.5"/>
+
+        <!-- Vách tường 4 (Ngang Bắc-Đông - từ x=1.40 sang x=+2.55 ở y=+1.85): tạo chữ Z trước khi vào Goal -->
+        <geom class="wall" name="wall_4" size="0.575 0.04 0.5" pos="1.975 1.85 0.5"/>
+    </worldbody>
+</mujoco>

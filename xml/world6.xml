@@ -1,0 +1,69 @@
+<mujoco model="diy_arena_map_world6_complex_labyrinth">
+    <!-- ============================================================================= -->
+    <!-- WORLD6.XML: BẢN ĐỒ MÊ CUNG ĐA HÀNH LANG CHỈ CÓ TƯỜNG (COMPLEX WALL-ONLY MAP)  -->
+    <!-- Đấu trường 6x6m, gồm 4 tường bao và 5 vách ngăn mê cung nối kín biên          -->
+    <!-- tạo thành 5 phân đoạn hành lang liên hoàn (2 khúc cua 180° + 2 khúc cua 90°   -->
+    <!-- + 1 vách chicane lệch dòng). Không có bất kỳ vật cản tĩnh hay động nào        -->
+    <!-- trước khi chạy A*. Sau khi chạy A* và trích xuất 6 Checkpoint SPH, hệ thống   -->
+    <!-- sẽ tiêm 4 vật cản động (0 vật cản tĩnh) cắt ngang 4 hành lang.                -->
+    <!-- ============================================================================= -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .2 .3" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="20 20" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.55 0.58 0.65 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="dyn_obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Sàn đấu trường 8x8 m -->
+        <geom name="ground" type="plane" size="4 4 0.1" material="gridmat"/>
+
+        <!-- ĐIỂM XUẤT PHÁT VÀ ĐÍCH ĐẾN (START / GOAL MARKERS) -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.22 0.004" pos="-2.25 -2.25 0.004" rgba="0.2 0.4 1 0.7" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.22 0.004" pos="2.25 2.25 0.004"   rgba="0.1 0.9 0.2 0.7" contype="0" conaffinity="0"/>
+
+        <!-- ================================================================= -->
+        <!-- 1. TƯỜNG BAO NGOÀI ĐẤU TRƯỜNG (OUTER BOUNDARY WALLS - 6x6 M)     -->
+        <!-- ================================================================= -->
+        <geom class="wall" name="wall_n" size="3.05 0.05 0.5" pos="0 3.0 0.5"/>
+        <geom class="wall" name="wall_s" size="3.05 0.05 0.5" pos="0 -3.0 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.05 0.5" pos="3.0 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.05 0.5" pos="-3.0 0 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 2. HỆ THỐNG 5 VÁCH TƯỜNG MÊ CUNG ĐA HÀNH LANG (CHỈ CÓ TƯỜNG)     -->
+        <!-- ================================================================= -->
+        <!-- Vách tường 1 (Dọc Tây - nối tường Nam từ y=-3.0 lên y=+1.35): mở cửa thông phía Bắc -->
+        <geom class="wall" name="wall_1" size="0.04 2.175 0.5" pos="-1.45 -0.825 0.5"/>
+
+        <!-- Vách tường 1b (Chicane ngang Tây - nhô từ tường Tây ở y=-0.35 vào x=-2.42): tạo nhịp lách S -->
+        <geom class="wall" name="wall_1_fin" size="0.29 0.04 0.5" pos="-2.71 -0.35 0.5"/>
+
+        <!-- Vách tường 2 (Dọc Trung tâm - nối tường Bắc từ y=+3.0 xuống y=-1.35): bắt buộc đi xuống Nam -->
+        <geom class="wall" name="wall_2" size="0.04 2.175 0.5" pos="-0.05 0.825 0.5"/>
+
+        <!-- Vách tường 3 (Dọc Đông-Nam - nối tường Nam từ y=-3.0 lên y=+0.35): bắt buộc vòng lên Trung tâm Đông -->
+        <geom class="wall" name="wall_3" size="0.04 1.675 0.5" pos="1.25 -1.325 0.5"/>
+
+        <!-- Vách tường 4 (Ngang Bắc-Đông - nối kín từ wall_2 tại x=-0.05 sang x=+1.60 ở y=+1.72): tạo hành lang chữ Z -->
+        <geom class="wall" name="wall_4" size="0.825 0.04 0.5" pos="0.775 1.72 0.5"/>
+    </worldbody>
+</mujoco>

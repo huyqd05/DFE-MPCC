@@ -1,0 +1,91 @@
+<mujoco model="diy_arena_map_world4">
+    <!-- ============================================================================= -->
+    <!-- WORLD4.XML: BẢN ĐỒ ĐẤU TRƯỜNG NÂNG CAO VỚI 3 VẬT THỂ ĐỘNG TỐC ĐỘ BIẾN THIÊN    -->
+    <!-- Đấu trường 6x6m, 3 Vật thể động (Dynamic Moving Obstacles) tuần hoàn:          -->
+    <!-- 1. dyn_obs_1: Trụ tím trượt ngang trục X tại ngách Tây (y = -0.10)            -->
+    <!-- 2. dyn_obs_2: Khối vàng trượt dọc trục Y tại góc cua Bắc (x = 0.05)          -->
+    <!-- 3. dyn_obs_3: Khối cyan trượt ngang trục X tại ngách Nam (y = -1.85)          -->
+    <!-- ============================================================================= -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .2 .3" width="300" height="300"/>
+        <material name="gridmat" texture="grid" texrepeat="20 20" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.6 0.6 0.65 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="dyn_obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 4" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Sàn đấu trường 8x8 m -->
+        <geom name="ground" type="plane" size="4 4 0.1" material="gridmat"/>
+
+        <!-- ĐIỂM XUẤT PHÁT VÀ ĐÍCH ĐẾN (START / GOAL MARKERS) -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.22 0.004" pos="-2.2 -2.2 0.004" rgba="0.2 0.4 1 0.7" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.22 0.004" pos="2.2 2.2 0.004"   rgba="0.1 0.9 0.2 0.7" contype="0" conaffinity="0"/>
+
+        <!-- ================================================================= -->
+        <!-- 1. TƯỜNG BAO NGOÀI ĐẤU TRƯỜNG (OUTER BOUNDARY WALLS - 6x6 M)     -->
+        <!-- ================================================================= -->
+        <geom class="wall" name="wall_n" size="3.05 0.05 0.5" pos="0 3.0 0.5"/>
+        <geom class="wall" name="wall_s" size="3.05 0.05 0.5" pos="0 -3.0 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.05 0.5" pos="3.0 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.05 0.5" pos="-3.0 0 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 2. HỆ THỐNG TƯỜNG NGĂN CHICANE (INTERIOR CHICANE WALLS)           -->
+        <!-- ================================================================= -->
+        <geom class="wall" name="wall_1" size="0.05 1.875 0.5" pos="-1.0 -1.075 0.5"/>
+        <geom class="wall" name="wall_2" size="0.05 1.875 0.5" pos="1.0 1.075 0.5"/>
+        <geom class="wall" name="wall_mid" size="0.35 0.05 0.5" pos="0.60 0.35 0.5"/>
+        <geom class="wall" name="wall_stub" size="0.45 0.05 0.5" pos="2.45 -0.35 0.5"/>
+
+        <!-- ================================================================= -->
+        <!-- 3. CHƯỚNG NGẠI VẬT CỐ ĐỊNH (STATIC OBSTACLES)                     -->
+        <!-- ================================================================= -->
+        <geom class="obs" name="obs_red"    type="cylinder" size="0.28 0.5" pos="-2.30 -0.80 0.5" rgba="0.85 0.2 0.2 1"/>
+        <geom class="obs" name="crate_a"    type="box" size="0.18 0.18 0.5" pos="-1.55 -1.65 0.5" rgba="0.9 0.7 0.2 1"/>
+        <geom class="obs" name="obs_blue"   type="cylinder" size="0.32 0.5" pos="-1.50 1.80 0.5" rgba="0.2 0.3 0.85 1"/>
+        <geom class="obs" name="crate_b"    type="box" size="0.20 0.18 0.5" pos="0.40 -0.85 0.5" rgba="0.8 0.5 0.15 1"/>
+        <geom class="obs" name="crate_c"    type="box" size="0.18 0.20 0.5" pos="1.35 -0.90 0.5" rgba="0.6 0.4 0.2 1"/>
+        <geom class="obs" name="crate_e"    type="box" size="0.15 0.15 0.5" pos="2.25 -1.35 0.5" rgba="0.7 0.45 0.25 1"/>
+        <geom class="obs" name="obs_green"  type="cylinder" size="0.28 0.5" pos="2.40 0.85 0.5" rgba="0.2 0.75 0.25 1"/>
+        <geom class="obs" name="crate_d"    type="box" size="0.18 0.18 0.5" pos="1.50 1.90 0.5" rgba="0.75 0.6 0.3 1"/>
+
+        <!-- ================================================================= -->
+        <!-- 4. HỆ THỐNG 3 VẬT THỂ ĐỘNG (3 DYNAMIC MOVING OBSTACLES)           -->
+        <!-- ================================================================= -->
+        <!-- VẬT THỂ ĐỘNG 1: Trụ tím trượt ngang trục X tại ngách Tây (y = -0.10) -->
+        <body name="dyn_obs_1" pos="-2.0 -0.10 0.5">
+            <joint name="dyn_joint_1" type="slide" axis="1 0 0" damping="1.0"/>
+            <geom name="geom_dyn_1" class="dyn_obs" type="cylinder" size="0.24 0.48" rgba="0.95 0.15 0.75 1"/>
+        </body>
+
+        <!-- VẬT THỂ ĐỘNG 2: Khối vàng trượt dọc trục Y tại góc cua Bắc (x = 0.05) -->
+        <body name="dyn_obs_2" pos="0.05 1.65 0.5">
+            <joint name="dyn_joint_2" type="slide" axis="0 1 0" damping="1.0"/>
+            <geom name="geom_dyn_2" class="dyn_obs" type="box" size="0.20 0.20 0.48" rgba="0.95 0.85 0.10 1"/>
+        </body>
+
+        <!-- VẬT THỂ ĐỘNG 3: Khối cyan trượt ngang trục X tại ngách Nam (y = -1.85) -->
+        <body name="dyn_obs_3" pos="0.75 -1.85 0.5">
+            <joint name="dyn_joint_3" type="slide" axis="1 0 0" damping="1.0"/>
+            <geom name="geom_dyn_3" class="dyn_obs" type="cylinder" size="0.24 0.48" rgba="0.05 0.85 0.95 1"/>
+        </body>
+    </worldbody>
+</mujoco>
