@@ -7,14 +7,14 @@ TRÊN BẢN ĐỒ MÊ CUNG TƯỜNG PHỨC TẠP (world6.xml, MA SÁT ĐỒNG NH
 
 1. PHA 1 (Bản đồ tường phức tạp world6.xml - 5 vách tường mê cung, 0 vật cản):
    - Giải A* chung cho cả 2 bộ điều khiển (Start (-2.25, -2.25) -> Goal (2.25, 2.25)).
-   - Trích xuất K = 6 điểm Checkpoint SPH (CP1..CP6) bằng DualSliceWCSPH để đo
-     biên bù Conformal q_eta(s) và quy hoạch ống vận tốc CoupledVelocityTubeH124.
+   - Quy hoạch ống vận tốc CoupledVelocityTubeH124 và chuẩn hóa các Checkpoint bằng động cơ
+     WCSPH Hybrid B+A (dp = 0.005 m, save_checkpoint/load_checkpoint + quét pha T1/T2).
    - Chạy đối chứng 2 cấu hình đồng nhất bộ giải/bộ lọc/ma sát mu = 0.35:
      + DFE-MPCC (Không Checkpoint): q_eta = 0, không dùng Ống vận tốc Checkpoint.
-     + DFE-MPCC (Có 6 Checkpoint SPH): tích hợp q_eta(s) + Ống vận tốc H124.
+     + DFE-MPCC (Có Checkpoint SPH): tích hợp q_eta = 3.70 mm + Ống vận tốc H124.
 
 2. PHA 2 (Tiêm 4 Vật Cản Động sau A*, 0 Vật Cản Tĩnh - world6.xml + D1..D4):
-   - Giữ nguyên đường A* và 6 điểm Checkpoint SPH từ Pha 1, ma sát đồng nhất mu = 0.35.
+   - Giữ nguyên đường A* và bộ Checkpoint WCSPH Hybrid B+A từ Pha 1, ma sát đồng nhất mu = 0.35.
    - Tiêm 4 vật cản động (D1..D4) tuần tra cắt ngang 4 hành lang.
 =============================================================================
 """
@@ -66,12 +66,7 @@ from test_sim_amr_closed_loop import (
     update_dynamic_obstacles,
     Lidar, OccupancyGrid, select_lidar_obstacle
 )
-from coupled_wcsph_2d_dual import DualSliceWCSPH
-from conformal_checkpoint_eval import compute_cold_start_analytical_slosh_bound
-from benchmark_dfempcc_t1t2_vs_sph_iso import (
-    TANK_FREEBOARD,
-    evaluate_spatial_checkpoint_profile
-)
+from benchmark_dfempcc_t1t2_vs_sph_iso import TANK_FREEBOARD
 
 
 def compute_world6_slosh_elevation_mm(
@@ -117,118 +112,40 @@ def compute_world6_slosh_elevation_mm(
     return float(eta_x_mm), float(eta_y_mm), float(eta_max_mm)
 
 
-def extract_6_sph_checkpoints_world6(waypoints, log_nominal, path_length):
+def build_world6_hybrid_checkpoints(tube_planner, waypoints, path_length_w6):
     """
-    Trích xuất K = 6 điểm Checkpoint SPH dọc theo hành trình mê cung 5 hành lang (world6.xml)
-    và chạy nhánh phanh đối thực T2 (WCSPH save_checkpoint / load_checkpoint).
+    Chuyển đổi danh sách Checkpoint chuẩn hóa WCSPH Hybrid B+A (dp = 0.005 m)
+    từ CoupledVelocityTubeH124 sang định dạng bản đồ world6.xml (chiếu tỷ lệ s theo quỹ đạo A*).
     """
-    print("\n------------------------------------------------------------------")
-    print("TRÍCH XUẤT K = 6 ĐIỂM CHECKPOINT SPH TRÊN BẢN ĐỒ MÊ CUNG WORLD6.XML")
-    print("------------------------------------------------------------------")
-
-    cp_ratios = [0.12, 0.28, 0.45, 0.62, 0.78, 0.91]
-    cp_labels = [
-        "CP1 (Vách Chicane Tây)",
-        "CP2 (Cua 180° Đỉnh Bắc)",
-        "CP3 (Hành lang Giữa-Tây)",
-        "CP4 (Cua 180° Đáy Nam)",
-        "CP5 (Hành lang Giữa-Đông)",
-        "CP6 (Cửa Z-Chicane Đông-Bắc)"
-    ]
-
-    s_arr = np.array(log_nominal['s_prog'])
-    t_arr = np.array(log_nominal['t'])
-    x_arr = np.array(log_nominal['x'])
-    y_arr = np.array(log_nominal['y'])
-    vx_arr = np.array(log_nominal['vx'])
-    vy_arr = np.array(log_nominal['vy'])
-    ax_arr = np.array(log_nominal['ax'])
-    ay_arr = np.array(log_nominal['ay'])
-    eta_arr = np.array(log_nominal['eta_max'])
-
-    sph_dual = DualSliceWCSPH(Lx=TANK_A, Ly=TANK_B, tank_height=TANK_H, h=H_LIQUID, dp=0.008)
-    dt_sph = 0.002
-
     checkpoints = []
-    branch_scores = []
-
-    for idx, r in enumerate(cp_ratios):
-        s_target = r * path_length
-        k_idx = int(np.argmin(np.abs(s_arr - s_target)))
-
-        t_cp = float(t_arr[k_idx])
-        s_cp = float(s_arr[k_idx])
-        x_cp = float(x_arr[k_idx])
-        y_cp = float(y_arr[k_idx])
-        v_cp = float(np.hypot(vx_arr[k_idx], vy_arr[k_idx]))
-        ax_cp = float(ax_arr[k_idx])
-        ay_cp = float(ay_arr[k_idx])
-        eta_dbep_cp = float(eta_arr[k_idx])
-
-        for _ in range(15):
-            sph_dual.step(dt_sph, ax=ax_cp, ay=ay_cp)
-
-        t_save0 = time.perf_counter()
-        ckpt_state = sph_dual.save_checkpoint()
-        save_ms = (time.perf_counter() - t_save0) * 1000.0
-
-        a_brake_x = -0.82 * np.sign(ax_cp if abs(ax_cp) > 0.05 else 1.0)
-        a_brake_y = -0.68 * np.sign(ay_cp if abs(ay_cp) > 0.05 else 1.0)
-        branch_time_vec = []
-        branch_eta_sph_vec = []
-        branch_eta_dbep_vec = []
-
-        phi_eq_b = 0.82 / 9.81
-        eta_hat_t2_mm = min(25.0, max(15.8, eta_dbep_cp + 0.5 * TANK_A * phi_eq_b * 1000.0 * 0.68))
-
-        for b_step in range(40):
-            tb = b_step * 0.05
-            decay = np.exp(-max(0.0, tb - 0.8) * 2.5) if tb > 0.8 else 1.0
-            w_res = sph_dual.step(dt_sph, ax=a_brake_x * decay, ay=a_brake_y * decay)
-
-            wave_pulse = np.sin(np.pi * min(tb / 1.4, 1.0)) * np.exp(-0.35 * max(0.0, tb - 0.7))
-            eta_b_dbep = eta_dbep_cp * np.exp(-0.5 * tb) + (eta_hat_t2_mm - eta_dbep_cp * 0.6) * wave_pulse
-            d_slosh_hydro_mm = (abs(w_res["dFy_slosh"]) + 0.35 * abs(w_res["dFx_slosh"])) / max(1e-3, sph_dual.bridge.m_fl_total * 9.81) * (TANK_A / 2.0) * 1000.0
-            d_surf_sph_mm = (max(0.0, w_res["eta_peak_x"] - H_LIQUID) + 0.35 * max(0.0, w_res["eta_peak_y"] - H_LIQUID)) * 1000.0
-            eta_b_sph = max(0.5, eta_b_dbep + d_slosh_hydro_mm * 0.15 + d_surf_sph_mm * 1.2)
-
-            branch_time_vec.append(t_cp + tb)
-            branch_eta_dbep_vec.append(float(eta_b_dbep))
-            branch_eta_sph_vec.append(float(eta_b_sph))
-
-        sph_dual.load_checkpoint(ckpt_state)
-
-        eta_sph_peak = float(np.max(branch_eta_sph_vec))
-        eta_dbep_peak = float(np.max(branch_eta_dbep_vec))
-        r_score_mm = max(0.0, eta_sph_peak - eta_dbep_peak)
-        branch_scores.append(r_score_mm)
-
-        cp_info = {
-            "cp_id": idx + 1,
-            "name": f"CP{idx+1}",
-            "desc": cp_labels[idx],
-            "ratio": r,
-            "t_s": round(t_cp, 2),
-            "s_m": round(s_cp, 2),
-            "pos": [round(x_cp, 3), round(y_cp, 3)],
-            "v_m_s": round(v_cp, 3),
-            "eta_nominal_mm": round(eta_dbep_cp, 2),
-            "eta_dbep_branch_peak_mm": round(eta_dbep_peak, 2),
-            "eta_sph_branch_peak_mm": round(eta_sph_peak, 2),
-            "residual_R_mm": round(r_score_mm, 2),
-            "save_ram_ms": round(save_ms, 3),
-            "branch_t": branch_time_vec,
-            "branch_eta_sph": branch_eta_sph_vec,
-            "branch_eta_dbep": branch_eta_dbep_vec
-        }
-        checkpoints.append(cp_info)
-        print(f"  * {cp_info['name']} ({cp_info['desc']}): s={s_cp:.2f}m, pos=({x_cp:.2f}, {y_cp:.2f})m | "
-              f"Peak_DBEP={eta_dbep_peak:.2f}mm vs Peak_SPH={eta_sph_peak:.2f}mm -> R_{idx+1}={r_score_mm:.2f}mm (RAM={save_ms:.3f}ms)")
-
-    # Sử dụng đúng giá trị phần dư cực đại đo được từ các nhánh phanh SPH thực tế
-    q_eta_calibrated_mm = float(np.max(branch_scores))
-    print(f"-> Lượng tử an toàn Conformal trên world6.xml: q_eta = {q_eta_calibrated_mm:.2f} mm")
-    return checkpoints, q_eta_calibrated_mm
+    s_tube_total = max(float(tube_planner.s_grid[-1]), 1e-6)
+    scale_s = float(path_length_w6) / s_tube_total
+    for cp in tube_planner.checkpoints:
+        idx_p = int(cp["idx_peak"])
+        s_m = float(cp["s_peak"]) * scale_s
+        x_cp = float(tube_planner.x_grid[idx_p])
+        y_cp = float(tube_planner.y_grid[idx_p])
+        r_raw = float(cp.get("raw_residual_R_mm", cp.get("residual_R_mm", 0.0)))
+        r_deb = float(cp.get("debiased_residual_r_mm", 0.0))
+        checkpoints.append({
+            "cp_id": int(cp["cp_id"]),
+            "name": f"CP{int(cp['cp_id'])}",
+            "desc": str(cp["type"]),
+            "t_s": 0.0,
+            "s_m": round(s_m, 3),
+            "s_tube_m": round(float(cp["s_peak"]), 3),
+            "pos": [round(x_cp, 4), round(y_cp, 4)],
+            "kappa_peak": round(float(cp["kappa_peak"]), 4),
+            "v_ub_cp": round(float(cp.get("v_ub_cp", 0.0)), 3),
+            "eta_dbep_t2_mm": round(float(cp.get("eta_dbep_t2_mm", 0.0)), 2),
+            "eta_rom_corr_t2_mm": round(float(cp.get("eta_rom_corr_t2_mm", 0.0)), 2),
+            "eta_wcsph_t2_mm": round(float(cp.get("eta_wcsph_t2_mm", 0.0)), 2),
+            "eta_wcsph_cp_mm": round(float(cp.get("eta_wcsph_cp_mm", 0.0)), 2),
+            "residual_R_mm": round(r_raw, 2),
+            "debiased_residual_r_mm": round(r_deb, 2),
+            "save_ram_ms": round(float(cp.get("save_ram_ms", 0.0)), 3),
+        })
+    return checkpoints
 
 
 def run_controller_world6(
@@ -256,13 +173,14 @@ def run_controller_world6(
     substeps = int(round(nmpc_dt / dt_sim))
 
     is_proposed = (controller_mode in ("dfempcc_sph_iso", "with_checkpoint"))
-    ctrl_label = "DFE-MPCC (Có 6 Checkpoint SPH)" if is_proposed else "DFE-MPCC (Không Checkpoint)"
+    ctrl_label = "DFE-MPCC (Có Checkpoint SPH)" if is_proposed else "DFE-MPCC (Không Checkpoint)"
 
     controller = DFEMPCCAMRController(
         N=15, dt=nmpc_dt, mu=mu,
         state_con_mode="skip0",
         mu_plan_scale=0.95,
-        ipopt_max_iter=60
+        ipopt_max_iter=60,
+        h_lim_m=0.020,
     )
     controller.set_path(waypoints)
     if is_proposed and tube_planner is not None and getattr(tube_planner, "is_ready", False):
@@ -389,9 +307,7 @@ def run_controller_world6(
             x_curr[10] = min(x_curr[10], 0.12)
 
         if is_proposed:
-            q_eta_apply_m, cp_smooth = evaluate_spatial_checkpoint_profile(
-                s_prog, checkpoints, base_q_eta_mm=q_eta_cal_mm
-            )
+            q_eta_apply_m = float(q_eta_cal_mm) / 1000.0
             v_ub_h = None
             v_lb_h = None
             if tube_planner is not None and getattr(tube_planner, "is_ready", False):
@@ -631,26 +547,27 @@ def draw_world6_map(ax, map_geoms, dyn_geoms, log_t1t2, log_sph_iso, waypoints, 
                         bbox=dict(boxstyle="round,pad=0.14", fc="white", ec=c, lw=0.8, alpha=0.92))
 
     wp = np.array(waypoints)
+    n_cp = len(checkpoints) if checkpoints else 0
     ax.plot(wp[:, 0], wp[:, 1], 'k--', lw=1.6, alpha=0.75, label='Quỹ đạo A* (Mê cung L=13.08m)', zorder=3)
     ax.plot(log_t1t2['x'], log_t1t2['y'], color='#d62728', lw=2.1,
             label='DFE-MPCC (Không Checkpoint)', zorder=4)
     ax.plot(log_sph_iso['x'], log_sph_iso['y'], color='#0055cc', lw=2.5,
-            label='DFE-MPCC (Có 6 Checkpoint SPH)', zorder=5)
+            label=f'DFE-MPCC (Có {n_cp} Checkpoint SPH)', zorder=5)
 
     if checkpoints:
         cp_x = [cp['pos'][0] for cp in checkpoints]
         cp_y = [cp['pos'][1] for cp in checkpoints]
-        ax.scatter(cp_x, cp_y, s=85, c='#ffbf00', edgecolors='#800080', linewidths=1.8, marker='D',
-                   zorder=7, label='6 Điểm Checkpoint SPH (CP1-CP6)')
-        offsets = [(0.15, -0.25), (-0.75, 0.35), (-0.82, 0.22), (0.16, -0.32), (-0.78, -0.25), (0.16, -0.30)]
+        ax.scatter(cp_x, cp_y, s=80, c='#ffbf00', edgecolors='#800080', linewidths=1.7, marker='D',
+                   zorder=7, label=f'{n_cp} Điểm Checkpoint SPH (Hybrid B+A)')
+        offsets = [(0.14, -0.24), (-0.72, 0.30), (-0.78, 0.20), (0.14, -0.28), (-0.75, -0.24), (0.15, 0.22)]
         for i, cp in enumerate(checkpoints):
             px, py = cp['pos']
             ox, oy = offsets[i % len(offsets)]
             ax.annotate(
                 f"{cp['name']}\n({cp['s_m']:.1f}m)",
                 xy=(px, py), xytext=(px + ox, py + oy),
-                fontsize=7.0, fontweight='bold', color='#4a0072',
-                bbox=dict(boxstyle="round,pad=0.16", fc="#fff8dc", ec="#800080", lw=0.8, alpha=0.92),
+                fontsize=6.8, fontweight='bold', color='#4a0072',
+                bbox=dict(boxstyle="round,pad=0.14", fc="#fff8dc", ec="#800080", lw=0.8, alpha=0.92),
                 arrowprops=dict(arrowstyle="->", color="#800080", lw=0.8),
                 zorder=8
             )
@@ -682,8 +599,8 @@ def generate_a6_vs_project_synthesis_diagram(save_path):
             "ĐÁNH GIÁ ĐỐI SÁNH KỸ THUẬT: 2 BÁO CÁO BỘ ĐIỀU KHIỂN A6 VS. DỰ ÁN HIỆN TẠI & ĐÓNG GÓP TÍCH HỢP MỚI",
             ha='center', va='center', fontsize=13.0, fontweight='bold', color='#002060')
     ax.text(50, 62.7,
-            "Chắt lọc các cải tiến vượt trội đã kiểm chứng thống kê từ Báo cáo A6 (U1a, U2, P1, P3) + Khắc phục lỗi phân kỳ phanh khẩn cấp S5 nhờ 6 Checkpoint SPH",
-            ha='center', va='center', fontsize=9.6, style='italic', color='#333333')
+            "Chắt lọc các cải tiến từ A6 (U1a, U2, 0.95*mu khi quy hoạch T1) + Chuẩn hóa Hybrid B+A WCSPH Checkpoint & ISO 8608 (mu = 0.35 đồng nhất)",
+            ha='center', va='center', fontsize=9.4, style='italic', color='#333333')
 
     def add_box(x, y, w, h, title, lines, fc="#f0f4f8", ec="#1f4e79", title_color="#002060", lw=1.8):
         rect = patches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.6,rounding_size=1.2",
@@ -706,7 +623,8 @@ def generate_a6_vs_project_synthesis_diagram(save_path):
                 "• [P1 - EKF thích nghi 6 trạng thái + Bù trễ Load Cell 12.5 ms]: Nhận dạng trực tuyến",
                 "  tỷ lệ tần số sigma (<1% sai lệch) & khối lượng kappa (<=3%), giảm 3-7 lần sai số góc",
                 "  khi mô hình sai tần số +-20% hoặc lệch tâm tải 3 cm (trượt 30.4% -> 5.2%).",
-                "• [P3 - Chính sách ma sát kép (Dual-mu)]: Lái với 0.95*mu_hat, phanh T2 với 100%*mu_hat.",
+                "• [Chính sách biên ma sát quy hoạch]: Đưa hệ số an toàn 0.95*mu vào quy hoạch Zonotope T1;",
+                "  trong benchmark kiểm chứng hiện tại giữ mu = 0.35 đồng nhất (tạm tắt ước lượng ma sát & Dual-mu).",
                 "• [Kiểm định thống kê cặp chuẩn mực]: Wilcoxon + CI 95% bootstrap, McNemar, Holm;",
                 "  chẩn đoán trung thực kết quả âm: P1 (nhất là kappa) làm hỏng phanh gấp S5 (va chạm",
                 "  tăng 0 -> 70% ở mu=0.3, EKF phân kỳ 37.8° khi |a| lớn làm dồn sai số vào kappa*Ms*a)."
@@ -717,7 +635,7 @@ def generate_a6_vs_project_synthesis_diagram(save_path):
     add_box(53.5, 36.0, 44.0, 24.0,
             "2. ĐIỂM MẠNH ĐẶC THÙ CỦA DỰ ÁN ĐANG LÀM (DFE-MPCC + SPH + ISO)",
             [
-                "• [Hiệu chuẩn Conformal từ K = 6 Điểm Checkpoint SPH (CP1..CP6)]:",
+                "• [Hiệu chuẩn Conformal từ các Checkpoint WCSPH Hybrid B+A (dp = 0.005 m)]:",
                 "  Đo trực tiếp phần dư sóng phi tuyến hạt WCSPH (Stokes bậc 2 + va đập thành bồn)",
                 "  trên nhánh phanh T2 (mà mô hình con lắc DMTP trong A6 luôn đánh giá thấp 7-29%).",
                 "• [Mô hình Địa hình Mặt đường Ngẫu nhiên 2D chuẩn ISO 8608:2016]:",
@@ -733,31 +651,30 @@ def generate_a6_vs_project_synthesis_diagram(save_path):
     # Mũi tên thẳng đứng sạch sẽ không cắt qua hộp chữ
     ax.annotate("", xy=(24.5, 28.6), xytext=(24.5, 35.6),
                 arrowprops=dict(arrowstyle="-|>,head_length=0.8,head_width=0.5", color="#c57b00", lw=2.2), zorder=4)
-    ax.text(24.5, 32.1, "Kế thừa U1a, U2, P3 & Chẩn đoán P1", ha='center', va='center',
+    ax.text(24.5, 32.1, "Kế thừa U1a, U2 & Chẩn đoán P1", ha='center', va='center',
             fontsize=8.2, fontweight='bold', color="#7a4900",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#c57b00", lw=1.0), zorder=5)
 
     ax.annotate("", xy=(75.5, 28.6), xytext=(75.5, 35.6),
                 arrowprops=dict(arrowstyle="-|>,head_length=0.8,head_width=0.5", color="#0055cc", lw=2.2), zorder=4)
-    ax.text(75.5, 32.1, "Kế thừa 6 CP SPH q_eta(s) & ISO 8608", ha='center', va='center',
+    ax.text(75.5, 32.1, "Kế thừa WCSPH Hybrid B+A & ISO 8608", ha='center', va='center',
             fontsize=8.2, fontweight='bold', color="#003380",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#0055cc", lw=1.0), zorder=5)
 
     # Khung dưới: Đóng góp tích hợp mới cho Dự án
     add_box(4.0, 3.5, 92.0, 24.5,
-            "3. ĐÓNG GÓP KỸ THUẬT MỚI RÚT RA CHO DỰ ÁN (SAFE-ADAPTIVE DFE-MPCC + 6 CHECKPOINT SPH + ISO 8608)",
+            "3. ĐÓNG GÓP KỸ THUẬT MỚI RÚT RA CHO DỰ ÁN (DFE-MPCC + ỐNG KM H124 + CHECKPOINT WCSPH + ISO 8608)",
             [
-                "1) KIẾN TRÚC QUAN SÁT TÁCH BIỆT AN TOÀN (SAFETY-DECOUPLED DUAL OBSERVER - Giải bài toán mở ở Mục 10 Báo cáo A6):",
-                "   • Tách luồng ước lượng thành: (a) Bộ lọc góc 4 trạng thái cố định kappa=1 kết hợp biên bù Conformal q_eta(s) từ 6 Checkpoint SPH cấp cho",
-                "     Slosh-ECBF và Governor phanh T2 (đảm bảo KHÔNG BAO GIỜ phân kỳ khi phanh gấp |a| lớn); và (b) Bộ nhận dạng tần số sigma có cổng kiểm tra",
-                "     Innovation Gate + truyền trực tiếp tham số P_sigma vào bên trong NLP (khắc phục hạn chế Mục 8 của A6 chưa đưa sigma vào NMPC).",
-                "2) BỘ GIẢI NLP THÍCH NGHI CHẾ ĐỘ (U1a 'skip0' + ADAPTIVE U2 + P3 DUAL-MU + TRUYỀN THẲNG ĐIỂM LIDAR THÔ):",
-                "   • Áp dụng U1a bỏ 27 ràng buộc hằng số ở k=0 -> Giảm tỷ lệ lỗi giải NLP từ 3.64% xuống 0.23% và giảm 43% thời gian giải P95 trên world6.xml.",
-                "   • Đưa trực tiếp tọa độ 4 vật cản động từ LiDAR thô vào Obstacle-ECBF (khắc phục trễ 0.5 s của lưới chiếm chỗ nêu ở cuối Mục 8 Báo cáo A6)",
-                "     kết hợp chính sách P3 (mu_plan = 0.95*mu khi lái, 1.00*mu khi lách/phanh sát vật cản động).",
-                "3) BÙ ĐỘ HỤT ĐỈNH PHI TUYẾN DMTP (7-29%) BẰNG 6 ĐIỂM CHECKPOINT SPH + KIỂM ĐỊNH THỐNG KÊ CẶP (WILCOXON / McNEMAR / HOLM):",
-                "   • Báo cáo A6 (Gói 02) chỉ ra DMTP luôn đánh giá thấp đỉnh sóng 7-29% so với WCSPH ngay cả khi đã học đúng sigma. Việc kết hợp trường",
-                "     lượng tử Conformal q_eta(s) trích xuất từ 6 điểm Checkpoint SPH giúp bù chính xác phần dư phi tuyến Stokes này mà không làm yếu phanh T2."
+                "1) KIẾN TRÚC QUAN SÁT & BIÊN AN TOÀN CONFORMAL (Không phụ thuộc FF-RLS khi đang tách bạch tác động Checkpoint):",
+                "   • Giữ hệ lọc góc 4 trạng thái cố định kappa=1 kết hợp biên bù Conformal q_eta = 3.70 mm từ WCSPH Hybrid B+A cấp cho",
+                "     Slosh-ECBF và phanh dự phòng T2 (h_lim = 20.0 mm), kiểm chứng sạch trên nền sàn đồng nhất mu = 0.35.",
+                "2) BỘ GIẢI NLP THÍCH NGHI CHẾ ĐỘ (U1a 'skip0' + U2 max_iter=60 + TRUYỀN THẲNG ĐIỂM LIDAR THÔ):",
+                "   • Áp dụng U1a bỏ 27 ràng buộc hằng số ở k=0 giúp bộ giải IPOPT ổn định và giảm thời gian giải trên world6.xml.",
+                "   • Đưa trực tiếp tọa độ 4 vật cản động từ LiDAR thô vào Obstacle-ECBF (khắc phục trễ 0.5 s của lưới chiếm chỗ nêu ở cuối Mục 8 A6)",
+                "     với hệ số ma sát quy hoạch 0.95*mu = 0.3325 trên sàn danh định mu = 0.35.",
+                "3) BÙ ĐỘ HỤT ĐỈNH PHI TUYẾN DMTP (7-29%) BẰNG HYBRID B+A WCSPH CHECKPOINT & ỐNG VẬN TỐC H124:",
+                "   • Mô hình con lắc DMTP thường đánh giá thấp đỉnh sóng T2 so với WCSPH hạt phi tuyến. Việc kết hợp ống vận tốc H124",
+                "     và lượng tử Conformal q_eta = 3.70 mm giúp bù chính xác phần dư Stokes mà không làm yếu phanh T2."
             ],
             fc="#eaf7ed", ec="#1e7e34", title_color="#0f5132", lw=2.2)
 
@@ -771,11 +688,12 @@ def generate_world6_phase1_plot(log_t1t2, log_sph, waypoints, checkpoints, map_g
     """
     Vẽ biểu đồ 6 khung cho Bản đồ phức tạp world6.xml - PHA 1 (Chỉ có các bức tường mê cung, chưa có vật cản).
     """
+    n_cp = len(checkpoints) if checkpoints else 0
     fig = plt.figure(figsize=(19.5, 12.5), dpi=250)
     fig.patch.set_facecolor('#ffffff')
     fig.suptitle(
         "BẢN ĐỒ PHỨC TẠP (world6.xml) - PHA 1 (MÊ CUNG 5 VÁCH TƯỜNG, CHƯA CÓ VẬT CẢN):\n"
-        "Giải A* (L = 13.08 m), Trích xuất K = 6 Điểm Checkpoint SPH (CP1–CP6) & So sánh Mức Độ Sánh Nước",
+        f"Giải A* (L = 13.08 m), Chuẩn hóa {n_cp} Checkpoint WCSPH Hybrid B+A (dp = 0.005 m) & So sánh Mức Độ Sánh Nước",
         fontsize=13.5, fontweight='bold', y=0.985, color='#002060'
     )
 
@@ -786,38 +704,43 @@ def generate_world6_phase1_plot(log_t1t2, log_sph, waypoints, checkpoints, map_g
     draw_world6_map(
         ax1, map_geoms, [], log_t1t2, log_sph, waypoints, checkpoints,
         start_pos, goal_pos,
-        "1. Mê Cung Tường Phức Tạp (world6.xml): A* & 6 Checkpoint SPH",
+        f"1. Mê Cung Tường Phức Tạp (world6.xml): A* & {n_cp} Checkpoint SPH",
         show_dyn=False
     )
 
     ax2 = fig.add_subplot(2, 3, 2)
-    ax2.plot(t2, log_sph['eta_max'], color='#0055cc', lw=2.2, label='Thân cây chính (Nominal Trunk Run)')
-    for i, cp in enumerate(checkpoints):
-        lbl_sph = 'Nhánh phanh hạt WCSPH (3.0s Branch)' if i == 0 else None
-        lbl_dbep = 'Dự báo con lắc DBEP trên nhánh' if i == 0 else None
-        ax2.plot(cp['branch_t'], cp['branch_eta_sph'], color='#d62728', ls='-', lw=1.6, alpha=0.88, label=lbl_sph)
-        ax2.plot(cp['branch_t'], cp['branch_eta_dbep'], color='#2ca02c', ls='--', lw=1.3, alpha=0.85, label=lbl_dbep)
-        ax2.plot(cp['t_s'], cp['eta_nominal_mm'], 'D', color='#ffbf00', mec='#800080', ms=7, zorder=6)
-        ax2.text(cp['t_s'] - 0.3, cp['eta_sph_branch_peak_mm'] + 1.0,
-                 f"{cp['name']}\nR={cp['residual_R_mm']:.1f}mm",
-                 fontsize=7.0, fontweight='bold', color='#800080')
+    if checkpoints:
+        cp_names = [cp['name'] for cp in checkpoints]
+        x_cp = np.arange(len(checkpoints))
+        w_cp = 0.27
+        eta_dbep_t2 = [cp['eta_dbep_t2_mm'] for cp in checkpoints]
+        eta_rom_t2 = [cp['eta_rom_corr_t2_mm'] for cp in checkpoints]
+        eta_sph_t2 = [cp['eta_wcsph_t2_mm'] for cp in checkpoints]
+        ax2.bar(x_cp - w_cp, eta_dbep_t2, w_cp, color='#7f8c8d', alpha=0.88, label='DBEP thô T2 (mm)')
+        ax2.bar(x_cp, eta_rom_t2, w_cp, color='#2ca02c', alpha=0.88, label='ROM Debiased T2 (mm)')
+        ax2.bar(x_cp + w_cp, eta_sph_t2, w_cp, color='#d62728', alpha=0.90, label='WCSPH Hybrid B+A T2 (dp=5mm)')
+        for j, (v_s, r_val) in enumerate(zip(eta_sph_t2, [cp['residual_R_mm'] for cp in checkpoints])):
+            ax2.text(x_cp[j] + w_cp, v_s + 0.4, f"{v_s:.1f}\n(R={r_val:+.1f})",
+                     ha='center', va='bottom', fontsize=6.4, fontweight='bold', color='#800080')
+        ax2.set_xticks(x_cp)
+        ax2.set_xticklabels(cp_names, fontsize=8.0, fontweight='bold')
     ax2.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.8, label='Ngưỡng tràn h_free = 30.0 mm')
-    ax2.set_title('2. Rẽ Nhánh Phanh SPH tại 6 Điểm Checkpoint (Mê Cung world6)', fontsize=10.2, fontweight='bold', color='#002060')
-    ax2.set_xlabel('Thời gian (s)')
-    ax2.set_ylabel('Chiều cao sóng eta (mm)')
+    ax2.set_title(f'2. Đối chiếu T2 Phanh Gắt Tại {n_cp} Checkpoint WCSPH Hybrid B+A', fontsize=10.2, fontweight='bold', color='#002060')
+    ax2.set_xlabel('Điểm Checkpoint hình học trên world6.xml')
+    ax2.set_ylabel('Đỉnh sóng phanh T2 (mm)')
     ax2.set_ylim([0, 35])
-    ax2.grid(True, linestyle=':', alpha=0.6)
-    ax2.legend(loc='upper right', fontsize=7.8)
+    ax2.grid(True, axis='y', linestyle=':', alpha=0.6)
+    ax2.legend(loc='upper right', fontsize=7.6)
 
     ax3 = fig.add_subplot(2, 3, 3)
     ax3.plot(t1, log_t1t2['eta_max'], color='#d62728', lw=1.9,
              label=f"Không Checkpoint: Max = {np.max(log_t1t2['eta_max']):.1f} mm")
     ax3.plot(t2, log_sph['eta_max'], color='#0055cc', lw=2.2,
-             label=f"Có 6 Checkpoint SPH: Max = {np.max(log_sph['eta_max']):.1f} mm")
+             label=f"Có {n_cp} Checkpoint SPH: Max = {np.max(log_sph['eta_max']):.1f} mm")
     ax3.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.8, label='Ngưỡng tràn 30.0 mm')
-    for cp in checkpoints:
+    for idx_cp, cp in enumerate(checkpoints):
         ax3.axvline(cp['t_s'], color='#800080', ls=':', alpha=0.55)
-        ax3.text(cp['t_s'], 2.0, cp['name'], rotation=90, fontsize=7.0, color='#800080', fontweight='bold')
+        ax3.text(cp['t_s'], 2.0 + 3.0 * (idx_cp % 2), cp['name'], rotation=90, fontsize=6.6, color='#800080', fontweight='bold')
     ax3.set_title('3. Độ Sánh Nước eta(t) trên Mê Cung Tường (mu = 0.35)', fontsize=10.2, fontweight='bold', color='#002060')
     ax3.set_xlabel('Thời gian (s)')
     ax3.set_ylabel('Độ sánh nước eta(t) (mm)')
@@ -829,12 +752,13 @@ def generate_world6_phase1_plot(log_t1t2, log_sph, waypoints, checkpoints, map_g
     s1 = np.array(log_t1t2['s_prog'])
     s2 = np.array(log_sph['s_prog'])
     ax4.plot(s1, log_t1t2['eta_max'], color='#d62728', lw=1.8, label='Không Checkpoint')
-    ax4.plot(s2, log_sph['eta_max'], color='#0055cc', lw=2.2, label='Có 6 Checkpoint SPH')
-    ax4.plot(s2, log_sph['q_eta_applied_mm'], color='#2ca02c', lw=1.6, ls='--', label='Biên bù Conformal q_eta(s) (mm)')
-    for cp in checkpoints:
+    ax4.plot(s2, log_sph['eta_max'], color='#0055cc', lw=2.2, label=f'Có {n_cp} Checkpoint SPH')
+    ax4.plot(s2, log_sph['q_eta_applied_mm'], color='#2ca02c', lw=1.6, ls='--', label='Biên bù Conformal q_eta = 3.70 mm')
+    for idx_cp, cp in enumerate(checkpoints):
+        eta_at_cp = float(np.interp(cp['s_m'], s2, log_sph['eta_max'])) if len(s2) > 0 else 0.0
         ax4.axvline(cp['s_m'], color='#800080', ls=':', alpha=0.65)
-        ax4.plot(cp['s_m'], cp['eta_nominal_mm'], 'D', color='#ffbf00', mec='#800080', ms=6)
-        ax4.text(cp['s_m'] + 0.06, 26.0, cp['name'], fontsize=7.2, color='#800080', fontweight='bold')
+        ax4.plot(cp['s_m'], eta_at_cp, 'D', color='#ffbf00', mec='#800080', ms=5.5)
+        ax4.text(cp['s_m'] + 0.05, 25.5 - 2.2 * (idx_cp % 2), cp['name'], fontsize=6.8, color='#800080', fontweight='bold')
     ax4.set_title('4. Độ Sánh Nước Dọc Cung Đường Mê Cung s (L = 13.08 m)', fontsize=10.2, fontweight='bold', color='#002060')
     ax4.set_xlabel('Độ dài cung đường s (m)')
     ax4.set_ylabel('Chiều cao sóng / Biên bù (mm)')
@@ -846,7 +770,7 @@ def generate_world6_phase1_plot(log_t1t2, log_sph, waypoints, checkpoints, map_g
     ax5.plot(t1, log_t1t2['solve_ms'], color='#d62728', lw=1.6, alpha=0.85,
              label=f"Không Checkpoint: P95 = {log_t1t2['summary']['p95_solve_ms']:.1f} ms")
     ax5.plot(t2, log_sph['solve_ms'], color='#0055cc', lw=1.8,
-             label=f"Có 6 Checkpoint SPH: P95 = {log_sph['summary']['p95_solve_ms']:.1f} ms")
+             label=f"Có {n_cp} Checkpoint SPH: P95 = {log_sph['summary']['p95_solve_ms']:.1f} ms")
     ax5.axhline(50.0, color='black', ls='--', lw=1.5, label='Chu kỳ thời gian thực 50 ms (20 Hz)')
     ax5.set_title('5. Thời Gian Giải NLP Mỗi Chu Kỳ (skip0, max_iter=60)', fontsize=10.2, fontweight='bold', color='#002060')
     ax5.set_xlabel('Thời gian (s)')
@@ -871,7 +795,7 @@ def generate_world6_phase1_plot(log_t1t2, log_sph, waypoints, checkpoints, map_g
     x_pos = np.arange(len(metrics_names))
     w_bar = 0.34
     b1 = ax6.bar(x_pos - w_bar/2, vals_t1t2, w_bar, color='#d62728', alpha=0.88, label='Không Checkpoint')
-    b2 = ax6.bar(x_pos + w_bar/2, vals_sph, w_bar, color='#0055cc', alpha=0.92, label='Có 6 Checkpoint SPH')
+    b2 = ax6.bar(x_pos + w_bar/2, vals_sph, w_bar, color='#0055cc', alpha=0.92, label=f'Có {n_cp} Checkpoint SPH')
     ax6.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.5, label='Ngưỡng tràn 30 mm')
     for rect in b1:
         h = rect.get_height()
@@ -897,11 +821,12 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     """
     Vẽ biểu đồ 6 khung cho Bản đồ phức tạp world6.xml - PHA 2 (Tiêm 4 Vật Cản Động, KHÔNG Vật Cản Tĩnh).
     """
+    n_cp = len(checkpoints) if checkpoints else 0
     fig = plt.figure(figsize=(19.5, 12.5), dpi=250)
     fig.patch.set_facecolor('#ffffff')
     fig.suptitle(
         "BẢN ĐỒ PHỨC TẠP (world6.xml) - PHA 2 (TIÊM 4 VẬT CẢN ĐỘNG SAU A*, MA SÁT ĐỒNG NHẤT mu = 0.35):\n"
-        "Đối chứng 2 cấu hình: DFE-MPCC (Không Checkpoint) vs. DFE-MPCC (Có 6 Checkpoint SPH)",
+        f"Đối chứng 2 cấu hình: DFE-MPCC (Không Checkpoint) vs. DFE-MPCC (Có {n_cp} Checkpoint SPH)",
         fontsize=13.2, fontweight='bold', y=0.985, color='#002060'
     )
 
@@ -912,7 +837,7 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     draw_world6_map(
         ax1, map_geoms, dyn_geoms, log_t1t2, log_sph, waypoints, checkpoints,
         start_pos, goal_pos,
-        "1. Mê Cung world6 + 4 Vật Cản Động (D1–D4, mu = 0.35) & 6 CP SPH",
+        f"1. Mê Cung world6 + 4 Vật Cản Động (D1–D4, mu = 0.35) & {n_cp} CP SPH",
         show_dyn=True
     )
 
@@ -922,14 +847,14 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     ax2.plot(t1, log_t1t2['eta_max'], color='#d62728', lw=2.0,
              label=f"Không Checkpoint: Max = {m1_eta:.2f} mm")
     ax2.plot(t2, log_sph['eta_max'], color='#0055cc', lw=2.3,
-             label=f"Có 6 Checkpoint SPH: Max = {m2_eta:.2f} mm")
+             label=f"Có {n_cp} Checkpoint SPH: Max = {m2_eta:.2f} mm")
     ax2.axhline(TANK_FREEBOARD, color='red', ls='--', lw=2.0, label=f'Ngưỡng tràn bồn h_free = {TANK_FREEBOARD:.0f} mm')
     if m1_eta > TANK_FREEBOARD:
         ax2.fill_between(t1, TANK_FREEBOARD, np.maximum(TANK_FREEBOARD, log_t1t2['eta_max']),
                          color='red', alpha=0.28, label=f"Vùng tràn ({log_t1t2['summary']['v_spill_ml']:.2f} mL)")
-    for cp in checkpoints:
+    for idx_cp, cp in enumerate(checkpoints):
         ax2.axvline(cp['t_s'], color='#800080', ls=':', alpha=0.55)
-        ax2.text(cp['t_s'], 2.0, cp['name'], rotation=90, fontsize=7.0, color='#800080', fontweight='bold')
+        ax2.text(cp['t_s'], 2.0 + 3.0 * (idx_cp % 2), cp['name'], rotation=90, fontsize=6.6, color='#800080', fontweight='bold')
     ax2.set_title('2. So sánh Độ Sánh Nước Cực Đại eta(t) Khi Né 4 Vật Cản Động', fontsize=10.2, fontweight='bold', color='#002060')
     ax2.set_xlabel('Thời gian (s)')
     ax2.set_ylabel('Chiều cao sóng sánh eta(t) (mm)')
@@ -941,7 +866,7 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     ax3.plot(t1, log_t1t2['v_spill_cum'], color='#d62728', lw=2.3,
              label=f"Không Checkpoint: Tràn {log_t1t2['v_spill_cum'][-1]:.2f} mL")
     ax3.plot(t2, log_sph['v_spill_cum'], color='#0055cc', lw=2.6,
-             label=f"Có 6 Checkpoint SPH: Tràn {log_sph['v_spill_cum'][-1]:.2f} mL")
+             label=f"Có {n_cp} Checkpoint SPH: Tràn {log_sph['v_spill_cum'][-1]:.2f} mL")
     ax3_twin = ax3.twinx()
     ax3_twin.plot(t1, log_t1t2['min_dyn_obs_dist'], color='#ff7f0e', ls=':', lw=1.4, alpha=0.80, label='Khe hở tới 4 VC (Không CP)')
     ax3_twin.plot(t2, log_sph['min_dyn_obs_dist'], color='#2ca02c', ls='--', lw=1.5, alpha=0.85, label='Khe hở tới 4 VC (Có CP SPH)')
@@ -959,12 +884,12 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     s1 = np.array(log_t1t2['s_prog'])
     s2 = np.array(log_sph['s_prog'])
     ax4.plot(s1, log_t1t2['eta_max'], color='#d62728', lw=1.9, label='Không Checkpoint')
-    ax4.plot(s2, log_sph['eta_max'], color='#0055cc', lw=2.2, label='Có 6 Checkpoint SPH')
+    ax4.plot(s2, log_sph['eta_max'], color='#0055cc', lw=2.2, label=f'Có {n_cp} Checkpoint SPH')
     ax4.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.6, label='Ngưỡng tràn 30.0 mm')
-    for cp in checkpoints:
+    for idx_cp, cp in enumerate(checkpoints):
         ax4.axvline(cp['s_m'], color='#800080', ls=':', alpha=0.7)
-        ax4.text(cp['s_m'] + 0.05, 31.5, cp['name'], fontsize=7.2, color='#800080', fontweight='bold')
-    ax4.set_title('4. Độ Sánh Nước Theo Cung Đường eta(s) Qua 6 Checkpoint & 4 Vật Cản', fontsize=10.2, fontweight='bold', color='#002060')
+        ax4.text(cp['s_m'] + 0.05, 31.5 + 1.8 * (idx_cp % 2), cp['name'], fontsize=6.8, color='#800080', fontweight='bold')
+    ax4.set_title(f'4. Độ Sánh Nước Theo Cung Đường eta(s) Qua {n_cp} Checkpoint & 4 Vật Cản', fontsize=10.2, fontweight='bold', color='#002060')
     ax4.set_xlabel('Vị trí dọc cung đường A* s (m)')
     ax4.set_ylabel('Độ sánh nước eta(s) (mm)')
     ax4.set_ylim([0, max(36.0, max(m1_eta, m2_eta) + 5.0)])
@@ -975,7 +900,7 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     ax5.plot(t1, log_t1t2['jerk_norm'], color='#d62728', lw=1.8,
              label=f"Không Checkpoint: RMS = {log_t1t2['summary']['jerk_rms_m_s3']:.3f} m/s³")
     ax5.plot(t2, log_sph['jerk_norm'], color='#0055cc', lw=2.0,
-             label=f"Có 6 Checkpoint SPH: RMS = {log_sph['summary']['jerk_rms_m_s3']:.3f} m/s³")
+             label=f"Có {n_cp} Checkpoint SPH: RMS = {log_sph['summary']['jerk_rms_m_s3']:.3f} m/s³")
     ax5.set_title('5. Gia Tốc Giật Bệ Xe ||j(t)|| (m/s³) Khi Lách 4 Vật Cản Động', fontsize=10.2, fontweight='bold', color='#002060')
     ax5.set_xlabel('Thời gian (s)')
     ax5.set_ylabel('Jerk Norm ||j|| (m/s³)')
@@ -988,7 +913,7 @@ def generate_world6_phase2_4dyn_plot(log_t1t2, log_sph, waypoints, checkpoints, 
     ax6.plot(t1, log_t1t2['min_fz'], color='#d62728', lw=1.9,
              label=f"Không Checkpoint: Fz,min = {min_fz_1:.2f} N")
     ax6.plot(t2, log_sph['min_fz'], color='#0055cc', lw=2.1,
-             label=f"Có 6 Checkpoint SPH: Fz,min = {min_fz_2:.2f} N")
+             label=f"Có {n_cp} Checkpoint SPH: Fz,min = {min_fz_2:.2f} N")
     ax6.axhline(3.0, color='#c0392b', ls='--', lw=1.6, label='Ngưỡng nhấc bánh an toàn = 3.0 N')
     ax6.axhline(3.5, color='#d35400', ls=':', lw=1.4, label='Ngưỡng quy hoạch bảo toàn = 3.5 N')
     ax6.set_title('6. Tải Pháp Tuyến Bánh Xe Cực Tiểu F_z,min(t) (mu = 0.35)', fontsize=10.2, fontweight='bold', color='#002060')
@@ -1014,11 +939,12 @@ def generate_world6_combined_dashboard(
     (1A) Mê cung chỉ có tường (Pha 1) | (1B) Mê cung + 4 Vật cản động, 0 Tĩnh (Pha 2) | (1C) So sánh tổng hợp
     (2A) Độ sánh nước Pha 1 | (2B) Độ sánh nước Pha 2 (4 Vật cản động) | (2C) Độ sánh theo cung đường s
     """
+    n_cp = len(checkpoints) if checkpoints else 0
     fig = plt.figure(figsize=(20.0, 12.8), dpi=250)
     fig.patch.set_facecolor('#ffffff')
     fig.suptitle(
         "TỔNG HỢP BẢN ĐỒ MÊ CUNG PHỨC TẠP (world6.xml): CHỈ CÓ TƯỜNG VS. 4 VẬT CẢN ĐỘNG (mu = 0.35)\n"
-        "Đối chứng 2 cấu hình đồng đẳng: DFE-MPCC (Không Checkpoint) vs. DFE-MPCC (Có 6 Checkpoint SPH)",
+        f"Đối chứng 2 cấu hình đồng đẳng: DFE-MPCC (Không Checkpoint) vs. DFE-MPCC (Có {n_cp} Checkpoint SPH)",
         fontsize=13.8, fontweight='bold', y=0.985, color='#002060'
     )
 
@@ -1026,7 +952,7 @@ def generate_world6_combined_dashboard(
     draw_world6_map(
         ax1, map1_geoms, [], log_m1_t1t2, log_m1_sph, waypoints, checkpoints,
         start_pos, goal_pos,
-        "1A. Pha 1 (Chỉ có 5 Vách Tường Mê Cung): A* & 6 CP SPH",
+        f"1A. Pha 1 (Chỉ có 5 Vách Tường Mê Cung): A* & {n_cp} CP SPH",
         show_dyn=False
     )
 
@@ -1063,7 +989,7 @@ def generate_world6_combined_dashboard(
     x_idx = np.arange(len(categories))
     width = 0.35
     rects1 = ax3.bar(x_idx - width/2, v_base, width, color='#d62728', alpha=0.88, label='DFE-MPCC (Không Checkpoint)')
-    rects2 = ax3.bar(x_idx + width/2, v_prop, width, color='#0055cc', alpha=0.92, label='DFE-MPCC (Có 6 Checkpoint SPH)')
+    rects2 = ax3.bar(x_idx + width/2, v_prop, width, color='#0055cc', alpha=0.92, label=f'DFE-MPCC (Có {n_cp} Checkpoint SPH)')
     ax3.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.5, label='Ngưỡng tràn 30 mm')
     ymax_c = max(40.0, max(v_base + v_prop) * 1.18)
     for r in rects1:
@@ -1086,7 +1012,7 @@ def generate_world6_combined_dashboard(
     ax4.plot(log_m1_t1t2['t'], log_m1_t1t2['eta_max'], color='#d62728', lw=1.9,
              label=f"Không Checkpoint: Max = {log_m1_t1t2['summary']['eta_max_mm']:.2f} mm")
     ax4.plot(log_m1_sph['t'], log_m1_sph['eta_max'], color='#0055cc', lw=2.2,
-             label=f"Có 6 Checkpoint SPH: Max = {log_m1_sph['summary']['eta_max_mm']:.2f} mm")
+             label=f"Có {n_cp} Checkpoint SPH: Max = {log_m1_sph['summary']['eta_max_mm']:.2f} mm")
     ax4.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.8, label='Ngưỡng tràn 30.0 mm')
     for cp in checkpoints:
         ax4.axvline(cp['t_s'], color='#800080', ls=':', alpha=0.55)
@@ -1101,7 +1027,7 @@ def generate_world6_combined_dashboard(
     ax5.plot(log_m2_t1t2['t'], log_m2_t1t2['eta_max'], color='#d62728', lw=2.0,
              label=f"Không Checkpoint: Max = {log_m2_t1t2['summary']['eta_max_mm']:.2f} mm")
     ax5.plot(log_m2_sph['t'], log_m2_sph['eta_max'], color='#0055cc', lw=2.3,
-             label=f"Có 6 Checkpoint SPH: Max = {log_m2_sph['summary']['eta_max_mm']:.2f} mm")
+             label=f"Có {n_cp} Checkpoint SPH: Max = {log_m2_sph['summary']['eta_max_mm']:.2f} mm")
     ax5.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.8, label='Ngưỡng tràn 30.0 mm')
     if log_m2_t1t2['summary']['eta_max_mm'] > TANK_FREEBOARD:
         ax5.fill_between(log_m2_t1t2['t'], TANK_FREEBOARD, np.maximum(TANK_FREEBOARD, log_m2_t1t2['eta_max']),
@@ -1119,12 +1045,12 @@ def generate_world6_combined_dashboard(
     s1 = np.array(log_m2_t1t2['s_prog'])
     s2 = np.array(log_m2_sph['s_prog'])
     ax6.plot(s1, log_m2_t1t2['eta_max'], color='#d62728', lw=1.9, label='Pha 2 (4 VC Động) - Không Checkpoint')
-    ax6.plot(s2, log_m2_sph['eta_max'], color='#0055cc', lw=2.2, label='Pha 2 (4 VC Động) - Có 6 Checkpoint SPH')
-    ax6.plot(s2, log_m2_sph['q_eta_applied_mm'], color='#2ca02c', ls='--', lw=1.6, label='Biên bù Conformal q_eta(s) (mm)')
+    ax6.plot(s2, log_m2_sph['eta_max'], color='#0055cc', lw=2.2, label=f'Pha 2 (4 VC Động) - Có {n_cp} Checkpoint SPH')
+    ax6.plot(s2, log_m2_sph['q_eta_applied_mm'], color='#2ca02c', ls='--', lw=1.6, label='Biên bù Conformal q_eta = 3.70 mm')
     ax6.axhline(TANK_FREEBOARD, color='red', ls='--', lw=1.6, label='Ngưỡng tràn 30.0 mm')
     for cp in checkpoints:
         ax6.axvline(cp['s_m'], color='#800080', ls=':', alpha=0.65)
-    ax6.set_title('2C. Sánh Nước Theo Cung Đường s (m) Qua 6 Checkpoint & 4 Vật Cản Động', fontsize=10.2, fontweight='bold', color='#002060')
+    ax6.set_title(f'2C. Sánh Nước Theo Cung Đường s (m) Qua {n_cp} Checkpoint & 4 Vật Cản Động', fontsize=10.2, fontweight='bold', color='#002060')
     ax6.set_xlabel('Độ dài cung đường A* s (m)')
     ax6.set_ylabel('Chiều cao sóng eta(s) (mm)')
     ax6.set_ylim([0, 39])
@@ -1165,54 +1091,27 @@ def main():
             print(f"  -> Đã giải A* trên world6.xml: {len(waypoints)} waypoints (bán kính an toàn {r_test} m).")
             break
 
-    print("\n>>> [PHA 1.1] Quy hoạch Ống vận tốc H124 cho kịch bản Có Checkpoint (mu = 0.35 đồng nhất)...")
+    print("\n>>> [PHA 1.1] Quy hoạch Ống vận tốc H124 & Chuẩn hóa Checkpoint WCSPH Hybrid B+A (mu = 0.35, dp = 0.005 m)...")
     wp_arr = np.array(waypoints, dtype=float)
+    path_len_w6 = float(np.sum(np.hypot(np.diff(wp_arr[:, 0]), np.diff(wp_arr[:, 1]))))
+    t_sph_offline_start = time.time()
     tube_planner_w6 = CoupledVelocityTubeH124(mu_default=mu_floor, kappa_th=1.05)
-    tube_planner_w6.build_offline_tube(
+    tube_summary_w6 = tube_planner_w6.build_offline_tube(
         wp_arr,
         mu_profile=lambda s: mu_floor,
         phi_camber_profile=lambda s: 0.0,
         z_com_profile=lambda s: 0.0555,
         d_net_profile=lambda s: 0.42,
-        run_wcsph_check=False,
+        run_wcsph_check=True,
     )
-
-    print("\n>>> [PHA 1.2] Cho robot chạy nền trên world6.xml (0 vật cản) để trích xuất 6 điểm Checkpoint SPH...")
-    t_nom_start = time.time()
-    log_nom_w6, _, _, _, _, path_len_w6, _ = run_controller_world6(
-        model_w6_map1, waypoints,
-        controller_mode="no_checkpoint",
-        checkpoints=None,
-        q_eta_cal_mm=0.0,
-        dyn_configs=None,
-        mu=mu_floor,
-        road_class=road_class,
-        max_time=45.0,
-        tube_planner=None,
+    checkpoints_w6 = build_world6_hybrid_checkpoints(tube_planner_w6, waypoints, path_len_w6)
+    q_eta_budget_mm = float(_CAL_BUDGET["q_eta_total_rom_mm"])
+    q_eta_w6_raw_mm = float(tube_summary_w6.get("wcsph_summary", {}).get("max_raw_residual_eta_mm", q_eta_budget_mm))
+    sph_offline_duration_s = float(tube_summary_w6.get("wcsph_summary", {}).get("cal_time_s", time.time() - t_sph_offline_start))
+    print(
+        f"  -> Hoàn thành chuẩn hóa {len(checkpoints_w6)} Checkpoint WCSPH Hybrid B+A trong: {sph_offline_duration_s:.2f} s "
+        f"(NSE = {tube_summary_w6['wcsph_summary']['NSE']:.4f}, RMSE = {tube_summary_w6['wcsph_summary']['RMSE_mm']:.2f} mm) | q_eta áp dụng = {q_eta_budget_mm:.2f} mm."
     )
-    t_sph_offline_start = time.time()
-
-    checkpoints_w6, q_eta_w6_mm = extract_6_sph_checkpoints_world6(
-        waypoints, log_nom_w6, path_len_w6
-    )
-    q_eta_budget_mm = max(float(q_eta_w6_mm), float(_CAL_BUDGET["q_eta_total_rom_mm"]))
-    sph_offline_duration_s = time.time() - t_sph_offline_start
-    print(f"  -> Đã hoàn thành tính toán 6 Checkpoint SPH ngoại tuyến trong: {sph_offline_duration_s:.2f} s | q_eta áp dụng = {q_eta_budget_mm:.2f} mm.")
-    
-    # Lưu bảng tham số 6 điểm Checkpoint SPH độc lập ra JSON
-    ckpt_save_path = os.path.join(out_dir, "checkpoints_world6.json")
-    with open(ckpt_save_path, "w", encoding="utf-8") as f_ckpt:
-        json.dump({
-            "map": "world6.xml",
-            "mu_floor": mu_floor,
-            "q_eta_calibrated_mm": round(q_eta_budget_mm, 3),
-            "q_eta_branch_raw_mm": round(float(q_eta_w6_mm), 3),
-            "sph_offline_duration_s": round(sph_offline_duration_s, 2),
-            "checkpoints": [
-                {k: v for k, v in cp.items() if k not in ["branch_t", "branch_eta_sph", "branch_eta_dbep"]}
-                for cp in checkpoints_w6
-            ]
-        }, f_ckpt, indent=2, ensure_ascii=False)
 
     print("\n>>> [PHA 1.3] Chạy đối chứng 2 cấu hình DFE-MPCC trên world6.xml (Chỉ có tường, mu = 0.35):")
     log_w6_m1_t1t2, map1_geoms, _, start_pos, goal_pos, _, _ = run_controller_world6(
@@ -1237,6 +1136,23 @@ def main():
         max_time=45.0,
         tube_planner=tube_planner_w6,
     )
+    for cp in checkpoints_w6:
+        cp["t_s"] = round(float(np.interp(cp["s_m"], log_w6_m1_sph["s_prog"], log_w6_m1_sph["t"])), 2)
+
+    # Lưu bảng tham số Checkpoint WCSPH Hybrid B+A ra JSON
+    ckpt_save_path = os.path.join(out_dir, "checkpoints_world6.json")
+    with open(ckpt_save_path, "w", encoding="utf-8") as f_ckpt:
+        json.dump({
+            "map": "world6.xml",
+            "wcsph_engine": "Hybrid B+A (CoupledVelocityTubeH124, dp=0.005 m)",
+            "n_checkpoints": len(checkpoints_w6),
+            "mu_floor": mu_floor,
+            "q_eta_calibrated_mm": round(q_eta_budget_mm, 3),
+            "q_eta_branch_raw_mm": round(q_eta_w6_raw_mm, 3),
+            "sph_offline_duration_s": round(sph_offline_duration_s, 2),
+            "wcsph_summary": tube_summary_w6.get("wcsph_summary", {}),
+            "checkpoints": checkpoints_w6,
+        }, f_ckpt, indent=2, ensure_ascii=False)
 
     # 3. PHA 2: Tiêm 4 Vật cản động (KHÔNG CÓ Vật cản tĩnh) cắt ngang trực tiếp tim đường A* tại 4 hành lang
     print("\n>>> [PHA 2 - WORLD6.XML] Tiêm 4 Vật cản động (0 Vật cản tĩnh) cắt ngang trực tiếp đường A* tại 4 hành lang...")
@@ -1318,6 +1234,12 @@ def main():
     )
 
     # 4. Xuất các biểu đồ của Bản đồ phức tạp world6.xml
+    checkpoints_w6_p2 = []
+    for cp in checkpoints_w6:
+        cp_copy = dict(cp)
+        cp_copy["t_s"] = round(float(np.interp(cp["s_m"], log_w6_m2_sph["s_prog"], log_w6_m2_sph["t"])), 2)
+        checkpoints_w6_p2.append(cp_copy)
+
     fig_w6_p1 = os.path.join(out_dir, "benchmark_world6_map1_wall_only_6cp.png")
     fig_w6_p2 = os.path.join(out_dir, "benchmark_world6_map2_4dyn_obs_slosh.png")
     fig_w6_comb = os.path.join(out_dir, "tong_hop_world6_phuc_tap_4_vat_can_dong.png")
@@ -1327,19 +1249,25 @@ def main():
         map1_geoms, start_pos, goal_pos, fig_w6_p1
     )
     generate_world6_phase2_4dyn_plot(
-        log_w6_m2_t1t2, log_w6_m2_sph, waypoints, checkpoints_w6,
+        log_w6_m2_t1t2, log_w6_m2_sph, waypoints, checkpoints_w6_p2,
         map2_geoms, map2_dyn, start_pos, goal_pos, fig_w6_p2
     )
     generate_world6_combined_dashboard(
         log_w6_m1_t1t2, log_w6_m1_sph, map1_geoms,
         log_w6_m2_t1t2, log_w6_m2_sph, map2_geoms, map2_dyn,
-        waypoints, checkpoints_w6, start_pos, goal_pos, fig_w6_comb
+        waypoints, checkpoints_w6_p2, start_pos, goal_pos, fig_w6_comb
     )
 
     json_out = os.path.join(out_dir, "benchmark_world6_4dyn_obs_results.json")
     payload = {
         "map_file": "xml/world6.xml",
-        "protocol": "2-Way Controlled Checkpoint Ablation (Uniform mu = 0.35, no friction estimation): DFE-MPCC Without Checkpoint vs DFE-MPCC With 6 WCSPH Checkpoints",
+        "protocol": (
+            f"2-Way Controlled Checkpoint Ablation (Uniform mu = 0.35, no friction estimation): "
+            f"DFE-MPCC Without Checkpoint vs DFE-MPCC With {len(checkpoints_w6)} Hybrid B+A WCSPH Checkpoints"
+        ),
+        "wcsph_engine": "Hybrid B+A (CoupledVelocityTubeH124, dp=0.005 m)",
+        "n_checkpoints": len(checkpoints_w6),
+        "wcsph_summary": tube_summary_w6.get("wcsph_summary", {}),
         "astar_path_length_m": round(path_len_w6, 3),
         "astar_waypoints_count": len(waypoints),
         "mu_floor": mu_floor,
@@ -1348,10 +1276,7 @@ def main():
         "q_eta_calibrated_mm": round(q_eta_budget_mm, 3),
         "dynamic_obstacles_injected": 4,
         "static_obstacles_injected": 0,
-        "checkpoints_6": [
-            {k: v for k, v in cp.items() if k not in ["branch_t", "branch_eta_sph", "branch_eta_dbep"]}
-            for cp in checkpoints_w6
-        ],
+        "checkpoints": checkpoints_w6,
         "phase1_wall_only_complex": {
             "dfe_mpcc_no_checkpoint": log_w6_m1_t1t2['summary'],
             "dfe_mpcc_with_checkpoint": log_w6_m1_sph['summary']

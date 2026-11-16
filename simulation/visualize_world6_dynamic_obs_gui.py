@@ -56,8 +56,6 @@ from test_sim_amr_closed_loop import (
 from benchmark_world6_complex_4dyn_obs import (
     TANK_A, TANK_B, H_LIQUID, TANK_FREEBOARD,
     compute_world6_slosh_elevation_mm,
-    extract_6_sph_checkpoints_world6,
-    evaluate_spatial_checkpoint_profile
 )
 
 
@@ -190,7 +188,7 @@ def run_gui_simulation(phase=2, controller_mode="proposed", speed_factor=1.0, ma
         },
         {
             "type": "dynamic_cylinder",
-            "center_override": [1.92, 1.25],
+            "center_override": [1.85, 1.25],
             "radius": 0.14,
             "amp": 0.30,
             "omega": 0.94,
@@ -236,11 +234,11 @@ def run_gui_simulation(phase=2, controller_mode="proposed", speed_factor=1.0, ma
     max_iter = 30 if is_proposed else 45
     q_eta_use = (q_eta_cal / 1000.0) if (is_proposed and phase == 2) else 0.0
 
-    print(f"  -> Khởi tạo DFE-MPCC (state_con_mode='{state_mode}', max_iter={max_iter}, q_eta={q_eta_use*1000:.2f}mm)...")
+    print(f"  -> Khởi tạo DFE-MPCC (state_con_mode='{state_mode}', max_iter={max_iter}, q_eta={q_eta_use*1000:.2f}mm, mu=0.35)...")
     controller = DFEMPCCAMRController(
         N=15,
         dt=0.05,
-        mu=0.20,
+        mu=0.35,
         state_con_mode=state_mode,
         mu_plan_scale=0.95 if is_proposed else 0.98,
         ipopt_max_iter=max_iter
@@ -261,7 +259,7 @@ def run_gui_simulation(phase=2, controller_mode="proposed", speed_factor=1.0, ma
     mujoco.mj_forward(model, data)
 
     nmpc_dt = 0.05
-    mu_base = 0.20
+    mu_base = 0.35
     sim_time = 0.0
     s_prog = 0.0
     vs_prog = 0.22
@@ -367,8 +365,10 @@ def run_gui_simulation(phase=2, controller_mode="proposed", speed_factor=1.0, ma
             if active_gate == -1:
                 dashing_gate_idx = -1
 
-            # Nền đường ISO 8608 với ma sát ngẫu nhiên cục bộ mu(x, y)
-            road_eval = road_profile.compute_wheel_loads_and_slosh_excitation(q_meas, v_meas, mu_nominal=mu_base)
+            # Nền đường ISO 8608 với ma sát đồng nhất mu = 0.35 (loại bỏ biến thiên ma sát)
+            road_eval = road_profile.compute_wheel_loads_and_slosh_excitation(
+                q_meas, v_meas, mu_nominal=mu_base, friction_variation_scale=0.0
+            )
             dfz_iso_now = road_eval["dfz_iso_wheels"] if is_proposed else np.zeros(4)
             a_road_body = road_eval["a_road_body"]
             mu_local = road_eval.get("mu_local", mu_base)

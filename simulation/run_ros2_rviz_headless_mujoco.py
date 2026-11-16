@@ -741,11 +741,12 @@ def build_map_scenario(map_name: str):
             {"name": "CP5", "desc": "Hành Lang Thẳng Đông", "s_m": 10.22, "pos": [0.96, -0.22], "R_mm": 1.58},
             {"name": "CP6", "desc": "Cửa Z-Chicane Đông-Bắc", "s_m": 11.90, "pos": [1.59, 1.20], "R_mm": 2.06},
         ]
+        east_goal_x = 1.85 if base_name == "world6.xml" else 1.92
         inj_configs = [
             {"type": "dynamic_cylinder", "center_override": [-2.02, 0.25], "radius": 0.14, "amp": 0.30, "omega": 1.05, "phase": 1.25, "slide_axis": "1 0 0", "rgba": "0.95 0.15 0.60 1", "name": "dyn_obs_1_west"},
             {"type": "dynamic_cylinder", "center_override": [-0.52, 0.18], "radius": 0.14, "amp": 0.28, "omega": 0.96, "phase": 0.45, "slide_axis": "1 0 0", "rgba": "0.05 0.72 0.85 1", "name": "dyn_obs_2_midwest"},
             {"type": "dynamic_cylinder", "center_override": [0.72, -0.45], "radius": 0.14, "amp": 0.26, "omega": 1.02, "phase": 2.15, "slide_axis": "1 0 0", "rgba": "0.98 0.55 0.05 1", "name": "dyn_obs_3_mideast"},
-            {"type": "dynamic_cylinder", "center_override": [1.92, 1.25], "radius": 0.14, "amp": 0.30, "omega": 0.94, "phase": 0.85, "slide_axis": "1 0 0", "rgba": "0.55 0.20 0.90 1", "name": "dyn_obs_4_east_goal"},
+            {"type": "dynamic_cylinder", "center_override": [east_goal_x, 1.25], "radius": 0.14, "amp": 0.30, "omega": 0.94, "phase": 0.85, "slide_axis": "1 0 0", "rgba": "0.55 0.20 0.90 1", "name": "dyn_obs_4_east_goal"},
         ]
         model, dyn_configs, _ = create_injected_simulation_model(f"xml/{base_name}", wp_arr, configs=inj_configs)
     elif base_name == "world5.xml":
@@ -810,6 +811,27 @@ def build_map_scenario(map_name: str):
             "s_obs": s_earliest,
         })
 
+    # Ưu tiên nạp danh sách Checkpoint Hybrid B+A WCSPH đã chuẩn hóa từ bao cao/checkpoints_<map>.json (nếu có)
+    map_stem = os.path.splitext(base_name)[0]
+    cp_json_path = os.path.join(PROJECT_DIR, "bao cao", f"checkpoints_{map_stem}.json")
+    if os.path.exists(cp_json_path):
+        try:
+            import json
+            with open(cp_json_path, "r", encoding="utf-8") as f_cp:
+                cp_data = json.load(f_cp)
+            raw_cps = cp_data.get("checkpoints", [])
+            if raw_cps:
+                normalized_cps = []
+                for idx_c, cp_item in enumerate(raw_cps):
+                    cp_copy = dict(cp_item)
+                    cp_copy.setdefault("name", f"CP{idx_c + 1}")
+                    cp_copy.setdefault("desc", "checkpoint")
+                    cp_copy["R_mm"] = float(cp_copy.get("R_mm", cp_copy.get("residual_R_mm", 0.0)))
+                    normalized_cps.append(cp_copy)
+                checkpoints_6 = normalized_cps
+        except Exception:
+            pass
+
     return {
         "map_name": base_name,
         "model": model,
@@ -832,6 +854,145 @@ def predict_gate_pos(g_desc: dict, t_query: float) -> np.ndarray:
     """Dự báo vị trí 2D (x, y) của vật cản động tại thời điểm t_query."""
     disp = g_desc["amp"] * math.sin(g_desc["omega"] * t_query + g_desc["phase"])
     return g_desc["base_pos"] + g_desc["axis_xy"] * disp
+
+
+def _predict_gate_window_clearance(
+    g_desc: dict,
+    s0: float,
+    v0: float,
+    v_dash_limit: float,
+    accel_dash: float,
+    t_start: float,
+    tau_max: float,
+    n_samples: int,
+    s_win_back: float,
+    s_win_ahead: float,
+    ctrl,
+) -> float:
+    """Tính khoảng hở nhỏ nhất dự báo khi robot băng qua cửa sổ cổng vật cản động."""
+    taus = np.linspace(0.0, tau_max, n_samples)
+    min_pred_c = 10.0
+    s_cur = s0
+    v_cur = v0
+    s_lo = g_desc["s_obs"] - s_win_back
+    s_hi = g_desc["s_obs"] + s_win_ahead
+    r_tot = g_desc["radius"] + 0.22
+    for idx_t, tau in enumerate(taus):
+        if idx_t > 0:
+            dt_t = float(tau - taus[idx_t - 1])
+            v_cur = min(v_dash_limit, v_cur + accel_dash * dt_t)
+            s_cur = min(s_cur + v_cur * dt_t, ctrl.path_length)
+        if s_lo <= s_cur <= s_hi:
+            p_rob, _, _ = ctrl.get_path_reference(s_cur)
+            p_obs = predict_gate_pos(g_desc, t_start + float(tau))
+            c_val = float(np.hypot(p_rob[0] - p_obs[0], p_rob[1] - p_obs[1])) - r_tot
+            if c_val < min_pred_c:
+                min_pred_c = c_val
+    return min_pred_c
+
+
+def evaluate_gate_crossing(
+    gate_descriptors: list,
+    s_prog: float,
+    v_curr: float,
+    sim_time: float,
+    dashing_gate: int,
+    ctrl,
+    tube_planner=None,
+    use_tube_speed: bool = True,
+    v_dash_fallback: float = 0.40,
+    v_dash_bounds: tuple = (0.32, 0.42),
+    delta_s_hi: float = 0.58,
+    base_clear_thresh: float = 0.06,
+    accel_dash: float = 0.80,
+    tau_extra: float = 1.0,
+    tau_floor: float = 3.5,
+    n_samples: int = 45,
+    s_win_back: float = 0.38,
+    s_win_ahead: float = 0.50,
+    s_end_margin: float = 0.55,
+):
+    """Đánh giá Đợi/Vượt tại các cổng vật cản động và trả về (should_wait, active_gate, new_dashing_gate, is_tight_gate)."""
+    should_wait = False
+    active_gate = -1
+    is_tight_gate = False
+
+    for idx_d, g_desc in enumerate(gate_descriptors):
+        if g_desc["s_obs"] > 50.0:
+            continue
+        delta_s = g_desc["s_obs"] - s_prog
+        if -0.45 <= delta_s <= delta_s_hi:
+            active_gate = idx_d
+            if dashing_gate == idx_d:
+                is_tight_gate = bool(g_desc.get("_is_tight_gate", False))
+                break
+
+            if use_tube_speed and tube_planner is not None and getattr(tube_planner, "is_ready", False):
+                v_tube_at_gate = float(np.interp(g_desc["s_obs"], tube_planner.s_grid, tube_planner.v_ub_nom))
+                v_dash_limit = min(v_dash_bounds[1], max(v_dash_bounds[0], v_tube_at_gate))
+            else:
+                v_dash_limit = v_dash_fallback
+
+            tau_max = max(tau_floor, (g_desc["s_obs"] + s_end_margin - s_prog) / max(0.20, v_dash_limit) + tau_extra)
+            min_pred_c = _predict_gate_window_clearance(
+                g_desc, s_prog, v_curr, v_dash_limit, accel_dash,
+                sim_time, tau_max, n_samples, s_win_back, s_win_ahead, ctrl,
+            )
+
+            cache_key = round(float(v_dash_limit), 3)
+            thresh_cache = g_desc.setdefault("_eff_thresh_cache", {})
+            tight_cache = g_desc.setdefault("_is_tight_cache", {})
+            eff_thresh = thresh_cache.get(cache_key)
+            if eff_thresh is None:
+                if min_pred_c >= base_clear_thresh:
+                    eff_thresh = base_clear_thresh
+                    tight_cache[cache_key] = False
+                else:
+                    # Cache ngưỡng khả thi nhất theo hình học quỹ đạo để tránh deadlock ở cổng chéo hẹp
+                    period = 2.0 * math.pi / max(abs(float(g_desc["omega"])), 0.2)
+                    s_wait = max(0.0, min(s_prog, g_desc["s_obs"] - 0.46))
+                    best_c = max(
+                        _predict_gate_window_clearance(
+                            g_desc, s_wait, 0.0, v_dash_limit, accel_dash,
+                            t0, tau_max, n_samples, s_win_back, s_win_ahead, ctrl,
+                        )
+                        for t0 in np.linspace(0.0, period, 36, endpoint=False)
+                    )
+                    if best_c >= base_clear_thresh:
+                        eff_thresh = base_clear_thresh
+                        tight_cache[cache_key] = False
+                    else:
+                        eff_thresh = max(0.003, best_c * 0.55) if best_c > 0.0 else (best_c - 0.008)
+                        tight_cache[cache_key] = True
+                thresh_cache[cache_key] = float(eff_thresh)
+
+            is_tight_gate = bool(tight_cache.get(cache_key, False))
+            g_desc["_is_tight_gate"] = is_tight_gate
+            if min_pred_c >= eff_thresh:
+                dashing_gate = idx_d
+                should_wait = False
+            else:
+                should_wait = True
+            break
+
+    if active_gate == -1:
+        dashing_gate = -1
+        is_tight_gate = False
+
+    return should_wait, active_gate, dashing_gate, is_tight_gate
+
+
+def select_tight_gate_obstacle(dyn_geoms: list, data: mujoco.MjData, q_meas: np.ndarray, far_obs: np.ndarray, d_thresh: float = 0.85, d_safe: float = 0.10) -> np.ndarray:
+    """Trả về tham số vật cản động gần nhất cho Obstacle-ECBF khi băng qua cổng chéo hẹp."""
+    best_p, best_r, best_dc = None, 0.14, 10.0
+    for g_id, r_obs, _, _, _ in dyn_geoms:
+        g_pos = data.geom_xpos[g_id][:2].copy()
+        dc = float(np.hypot(q_meas[0] - g_pos[0], q_meas[1] - g_pos[1])) - (r_obs + 0.20)
+        if dc < best_dc:
+            best_dc, best_p, best_r = dc, g_pos, float(r_obs)
+    if best_p is not None and best_dc < d_thresh:
+        return np.array([best_p[0], best_p[1], 0.0, best_r, d_safe], dtype=float)
+    return far_obs
 
 
 def plot_post_simulation_results(
@@ -1150,56 +1311,28 @@ def run_ros2_rviz_headless_simulation(
         dphi_y_meas = float(data.qvel[4])
 
         # Kiểm tra điều kiện Đợi/Vượt dọc cung đường A* (Predictive 1D Longitudinal Gate-Timing)
-        should_wait = False
-        active_gate = -1
-        for idx_d, g_desc in enumerate(gate_descriptors):
-            if g_desc["s_obs"] > 50.0:
-                continue
-            delta_s = g_desc["s_obs"] - s_prog
-            if -0.45 <= delta_s <= 0.52:
-                active_gate = idx_d
-                if dashing_gate_idx == idx_d:
-                    should_wait = False
-                else:
-                    # Đồng bộ vận tốc phóng dự báo và tính toán gia tốc thực tế từ điểm dừng (a_acc = 0.6 m/s^2)
-                    if tube_planner is not None and getattr(tube_planner, "is_ready", False):
-                        v_tube_at_gate = float(np.interp(g_desc["s_obs"], tube_planner.s_grid, tube_planner.v_ub_nom))
-                        v_dash_limit = min(0.48, max(0.28, v_tube_at_gate))
-                    else:
-                        v_dash_limit = min(0.48, max(0.28, v_ref_cmd))
-
-                    tau_max = max(4.0, (g_desc["s_obs"] + 0.65 - s_prog) / max(0.20, v_dash_limit) + 1.2)
-                    taus = np.linspace(0.0, tau_max, 55)
-                    min_pred_c = 10.0
-
-                    s_taus = []
-                    s_cur = s_prog
-                    v_cur = float(np.hypot(v_meas[0], v_meas[1]))
-                    for tau_idx in range(len(taus)):
-                        if tau_idx > 0:
-                            dt_tau = float(taus[tau_idx] - taus[tau_idx - 1])
-                            v_cur = min(v_dash_limit, v_cur + 0.60 * dt_tau)
-                            s_cur = min(s_cur + v_cur * dt_tau, controller.path_length)
-                        s_taus.append(s_cur)
-
-                    for tau_idx, tau in enumerate(taus):
-                        s_tau = s_taus[tau_idx]
-                        if (g_desc["s_obs"] - 0.40) <= s_tau <= (g_desc["s_obs"] + 0.55):
-                            p_rob_tau, _, _ = controller.get_path_reference(s_tau)
-                            p_obs_tau = predict_gate_pos(g_desc, sim_time + tau)
-                            c_tau = float(np.hypot(p_rob_tau[0] - p_obs_tau[0], p_rob_tau[1] - p_obs_tau[1])) - (g_desc["radius"] + 0.22)
-                            if c_tau < min_pred_c:
-                                min_pred_c = c_tau
-
-                    if min_pred_c >= 0.05:
-                        dashing_gate_idx = idx_d
-                        should_wait = False
-                    else:
-                        should_wait = True
-                break
-
-        if active_gate == -1:
-            dashing_gate_idx = -1
+        v_fb = min(0.48, max(0.28, locals().get("v_ref_cmd", 0.35)))
+        should_wait, active_gate, dashing_gate_idx, is_tight_gate = evaluate_gate_crossing(
+            gate_descriptors=gate_descriptors,
+            s_prog=s_prog,
+            v_curr=float(np.hypot(v_meas[0], v_meas[1])),
+            sim_time=sim_time,
+            dashing_gate=dashing_gate_idx,
+            ctrl=controller,
+            tube_planner=tube_planner,
+            use_tube_speed=True,
+            v_dash_fallback=v_fb,
+            v_dash_bounds=(0.28, 0.48),
+            delta_s_hi=0.52,
+            base_clear_thresh=0.05,
+            accel_dash=0.60,
+            tau_extra=1.2,
+            tau_floor=4.0,
+            n_samples=55,
+            s_win_back=0.40,
+            s_win_ahead=0.55,
+            s_end_margin=0.65,
+        )
 
         road_eval = road_profile.compute_wheel_loads_and_slosh_excitation(
             q_meas, v_meas, mu_nominal=mu_zone_fn
@@ -1245,8 +1378,9 @@ def run_ros2_rviz_headless_simulation(
             jerk_val = 0.0
             sol_ms = 0.5
         else:
+            obs_for_ctrl = select_tight_gate_obstacle(dyn_geoms, data, q_meas, far_obs) if is_tight_gate else far_obs
             u_opt, js_opt, x_pred, u_pred, info = controller.solve_step(
-                x_curr, phi_est, far_obs,
+                x_curr, phi_est, obs_for_ctrl,
                 mu_floor=mu_min_w,
                 q_eta=q_eta_use,
                 dfz_iso=dfz_iso_now
@@ -1496,7 +1630,7 @@ if __name__ == "__main__":
         rviz_p = None
         pj_p = None
         all_summaries = []
-        map_list = ["world.xml", "world2.xml", "world3.xml", "world4.xml", "world5.xml", "world6.xml", "world7.xml"]
+        map_list = ["world.xml", "world2.xml", "world3.xml", "world4.xml", "world5.xml", "world6.xml", "world7.xml", "world8.xml"]
         for m_name in map_list:
             s_res, rviz_p, pj_p = run_ros2_rviz_headless_simulation(
                 map_name=m_name,

@@ -11,8 +11,8 @@ chưa kích hoạt ước lượng ma sát hay bẫy ma sát):
 
   - LƯỢT 1/2 (MÀU CAM - DFE-MPCC Không Checkpoint): DFE-MPCC cơ sở với bộ giải/bộ lọc
     tương đương, nhưng chưa chuẩn hóa Checkpoint WCSPH & Conformal (q_eta = 0, không ống H124).
-  - LƯỢT 2/2 (MÀU XANH LỤC - DFE-MPCC Có 6 Checkpoint SPH): Tích hợp đầy đủ Ống vận tốc
-    Krasnoselskii-Mann H124 + 6 Checkpoint WCSPH & dự trữ phân vị Conformal q_eta = 3.70 mm.
+  - LƯỢT 2/2 (MÀU XANH LỤC - DFE-MPCC Có Checkpoint SPH): Tích hợp đầy đủ Ống vận tốc
+    Krasnoselskii-Mann H124 + Checkpoint WCSPH Hybrid B+A & dự trữ phân vị Conformal q_eta = 3.70 mm.
 =========================================================================================
 """
 
@@ -25,7 +25,7 @@ import argparse
 import subprocess
 import numpy as np
 import matplotlib
-if "--plot" not in sys.argv:
+if "--no-plot" in sys.argv or "--all-maps" in sys.argv or not os.environ.get("DISPLAY"):
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -57,7 +57,9 @@ from run_ros2_rviz_headless_mujoco import (
     build_map_scenario,
     compute_static_clearance,
     euler_to_quaternion,
+    evaluate_gate_crossing,
     predict_gate_pos,
+    select_tight_gate_obstacle,
     SimpatRos2RvizHeadlessNode,
 )
 
@@ -77,12 +79,12 @@ VARIANT_META = {
         "desc": "DFE-MPCC cơ sở (q_eta = 0, không ống vận tốc H124 & không chuẩn hóa WCSPH Checkpoint)",
     },
     "full": {
-        "title": "DFE-MPCC (Có 6 Checkpoint SPH)",
-        "short_name": "DFE-MPCC (Có 6 Checkpoint SPH)",
+        "title": "DFE-MPCC (Có Checkpoint SPH)",
+        "short_name": "DFE-MPCC (Có Checkpoint SPH)",
         "color_hex": "#117864",
         "color_rgba": ColorRGBA(r=0.08, g=0.82, b=0.48, a=0.95),
         "tag": "LƯỢT 2/2",
-        "desc": "Tích hợp Ống vận tốc Krasnoselskii-Mann H124 + 6 Checkpoint WCSPH/Conformal (mu = 0.35)",
+        "desc": "Tích hợp Ống vận tốc Krasnoselskii-Mann H124 + Checkpoint WCSPH Hybrid B+A / Conformal (mu = 0.35)",
     },
 }
 
@@ -153,6 +155,7 @@ def publish_single_variant_markers(
     scan_hits: np.ndarray,
     path_length: float,
     cycle: int,
+    baseline_traj_xy: list = None,
 ):
     """
     Xuất bản duy nhất robot đang chạy trong lượt hiện tại lên ROS 2 RViz2, kèm:
@@ -237,6 +240,23 @@ def publish_single_variant_markers(
         for pt_xy in st["traj_xy"][::step_idx]:
             m_trail.points.append(Point(x=float(pt_xy[0]), y=float(pt_xy[1]), z=0.022))
         ma.markers.append(m_trail)
+
+    # 4. Ở lượt Có Checkpoint (Lượt 2/2), vẽ chồng vệt Lượt 1 (Không Checkpoint) màu cam mờ để so sánh trực tiếp
+    if baseline_traj_xy and len(baseline_traj_xy) >= 2 and variant_key == "full":
+        m_base = Marker()
+        m_base.header.stamp = now
+        m_base.header.frame_id = "map"
+        m_base.ns = "baseline_comparison_trail"
+        m_base.id = 11
+        m_base.type = Marker.LINE_STRIP
+        m_base.action = Marker.ADD
+        m_base.pose.orientation.w = 1.0
+        m_base.scale.x = 0.024
+        m_base.color = ColorRGBA(r=0.95, g=0.55, b=0.10, a=0.55)
+        step_b = max(1, len(baseline_traj_xy) // 260)
+        for pt_xy in baseline_traj_xy[::step_b]:
+            m_base.points.append(Point(x=float(pt_xy[0]), y=float(pt_xy[1]), z=0.014))
+        ma.markers.append(m_base)
 
     ros_node.marker_pub.publish(ma)
 
@@ -330,13 +350,14 @@ def run_single_variant_simulation(
     rviz_proc = None,
     live_plotter = None,
     tube_planner = None,
+    baseline_traj_xy: list = None,
 ) -> dict:
     """
-    Thực thi độc lập 1 lượt chạy hoàn chỉnh cho biến thể variant_key trên world7.xml:
-      1. Khởi tạo controller và đặt lại robot ở start_pos (-2.25, -2.25).
+    Thực thi độc lập 1 lượt chạy hoàn chỉnh cho biến thể variant_key trên bản đồ scen["map_name"]:
+      1. Khởi tạo controller và đặt lại robot ở start_pos.
       2. Làm sạch vệt quỹ đạo cũ trên RViz2.
       3. Lặp 20 Hz NMPC + 200 Hz MuJoCo Headless SiL + Quét 180 tia LiDAR độc lập.
-      4. Tích hợp phân vùng ma sát vĩ mô + vi mô ngẫu nhiên ISO 8608 Class B (Seed 32).
+      4. Tích hợp mặt sàn đồng nhất mu = 0.35 + mấp mô hình học ISO 8608 Class B (Seed 32).
       5. Ghi nhận đầy đủ chuỗi thời gian quỹ đạo, eta(s), Fz(s), v(s), slack.
     """
     v_info = VARIANT_META[variant_key]
@@ -351,12 +372,13 @@ def run_single_variant_simulation(
     goal_pos = scen["goal_pos"]
 
     print("\n" + "=" * 108)
-    print(f"  BẮT ĐẦU {v_info['tag']}: {v_info['title'].upper()}")
+    print(f"  BẮT ĐẦU {v_info['tag']} [{scen['map_name'].upper()}]: {v_info['title'].upper()}")
     print(f"  Đặc tính: {v_info['desc']}")
     print(f"  Mặt sàn: Phẳng hoàn toàn, ma sát đồng nhất mu = 0.35 + mấp mô hình học 2D ISO 8608 Class B")
     print("=" * 108)
 
-    # 1. Khởi tạo Controller DFE-MPCC đồng đẳng
+    # 1. Khởi tạo Controller DFE-MPCC đồng đẳng (h_lim_m=0.020 m = ngưỡng Stokes để P_q_eta siết ECBF & T2)
+    xy_bnd = 3.25 if "world8" in scen["map_name"].lower() else 3.0
     ctrl = DFEMPCCAMRController(
         N=15,
         dt=0.05,
@@ -364,8 +386,9 @@ def run_single_variant_simulation(
         state_con_mode="skip0",
         mu_plan_scale=0.95,
         ipopt_max_iter=60,
-        x_bounds=(-3.0, 3.0),
-        y_bounds=(-3.0, 3.0),
+        h_lim_m=0.020,
+        x_bounds=(-xy_bnd, xy_bnd),
+        y_bounds=(-xy_bnd, xy_bnd),
     )
     ctrl.set_path(wp_arr)
     # Biến thể Có Checkpoint: Nhúng Ống vận tốc khả thi bậc 3 vào bộ giải NLP trực tuyến
@@ -465,60 +488,29 @@ def run_single_variant_simulation(
         phi_y_meas = float(d_mj.qpos[4])
         dphi_y_meas = float(d_mj.qvel[4])
 
-        # Đánh giá cổng vật cản động (Gate Crossing)
-        should_wait = False
-        active_gate = -1
-        for idx_d, g_desc in enumerate(gate_descriptors):
-            if g_desc["s_obs"] > 50.0:
-                continue
-            delta_s = g_desc["s_obs"] - st["s_prog"]
-            # Kích hoạt vùng cổng khi tiếp cận từ khoảng 0.55 m phía trước
-            if -0.45 <= delta_s <= 0.58:
-                active_gate = idx_d
-                # Khi đã bắt đầu dash và tiến vào hành lang giao cắt, dứt khoát vượt qua, không dừng giữa luồng quét
-                if st["dashing_gate"] == idx_d:
-                    should_wait = False
-                else:
-                    # Đồng bộ vận tốc phóng dự báo và tính toán gia tốc thực tế từ điểm dừng (a_acc = 0.8 m/s^2)
-                    if tube_planner is not None and getattr(tube_planner, "is_ready", False):
-                        v_tube_at_gate = float(np.interp(g_desc["s_obs"], tube_planner.s_grid, tube_planner.v_ub_nom))
-                        v_dash_limit = min(0.42, max(0.32, v_tube_at_gate))
-                    else:
-                        v_dash_limit = 0.40
-
-                    tau_max = max(3.5, (g_desc["s_obs"] + 0.55 - st["s_prog"]) / max(0.20, v_dash_limit) + 1.0)
-                    taus = np.linspace(0.0, tau_max, 45)
-                    min_pred_c = 10.0
-
-                    # Mô phỏng tiến độ s_tau có gia tốc thực tế v_target = 0.38 m/s
-                    s_taus = []
-                    s_cur = st["s_prog"]
-                    v_cur = float(np.hypot(v_meas[0], v_meas[1]))
-                    for tau_idx in range(len(taus)):
-                        if tau_idx > 0:
-                            dt_tau = float(taus[tau_idx] - taus[tau_idx - 1])
-                            v_cur = min(v_dash_limit, v_cur + 0.80 * dt_tau)
-                            s_cur = min(s_cur + v_cur * dt_tau, ctrl.path_length)
-                        s_taus.append(s_cur)
-
-                    for tau_idx, tau in enumerate(taus):
-                        s_tau = s_taus[tau_idx]
-                        if (g_desc["s_obs"] - 0.38) <= s_tau <= (g_desc["s_obs"] + 0.50):
-                            p_rob_tau, _, _ = ctrl.get_path_reference(s_tau)
-                            p_obs_tau = predict_gate_pos(g_desc, sim_time + tau)
-                            c_tau = float(np.hypot(p_rob_tau[0] - p_obs_tau[0], p_rob_tau[1] - p_obs_tau[1])) - (g_desc["radius"] + 0.22)
-                            if c_tau < min_pred_c:
-                                min_pred_c = c_tau
-
-                    if min_pred_c >= 0.06:
-                        st["dashing_gate"] = idx_d
-                        should_wait = False
-                    else:
-                        should_wait = True
-                break
-
-        if active_gate == -1:
-            st["dashing_gate"] = -1
+        # Đánh giá cổng vật cản động (Gate Crossing) dùng helper dùng chung
+        should_wait, active_gate, dashing_new, is_tight_gate = evaluate_gate_crossing(
+            gate_descriptors=gate_descriptors,
+            s_prog=st["s_prog"],
+            v_curr=float(np.hypot(v_meas[0], v_meas[1])),
+            sim_time=sim_time,
+            dashing_gate=st["dashing_gate"],
+            ctrl=ctrl,
+            tube_planner=tube_planner,
+            use_tube_speed=(variant_key == "full"),
+            v_dash_fallback=0.40,
+            v_dash_bounds=(0.32, 0.42),
+            delta_s_hi=0.58,
+            base_clear_thresh=0.06,
+            accel_dash=0.80,
+            tau_extra=1.0,
+            tau_floor=3.5,
+            n_samples=45,
+            s_win_back=0.38,
+            s_win_ahead=0.50,
+            s_end_margin=0.55,
+        )
+        st["dashing_gate"] = dashing_new
 
         d_cp_min = min([abs(st["s_prog"] - cp["s_m"]) for cp in checkpoints_6]) if checkpoints_6 else 2.0
         cp_factor = math.exp(-0.5 * (d_cp_min / 0.42) ** 2)
@@ -597,8 +589,9 @@ def run_single_variant_simulation(
             jerk_val = 0.0
             sol_ms = 0.5
         else:
+            obs_for_ctrl = select_tight_gate_obstacle(dyn_geoms, d_mj, q_meas, far_obs) if is_tight_gate else far_obs
             u_opt, _, x_pred, _, sol_info = ctrl.solve_step(
-                x_curr, phi_est, far_obs,
+                x_curr, phi_est, obs_for_ctrl,
                 mu_floor=mu_solve,
                 q_eta=q_eta_use,
                 dfz_iso=dfz_iso_now,
@@ -758,6 +751,7 @@ def run_single_variant_simulation(
                 scan_hits=hit,
                 path_length=ctrl.path_length,
                 cycle=cycle,
+                baseline_traj_xy=baseline_traj_xy,
             )
             rclpy.spin_once(ros_node, timeout_sec=0.002)
 
@@ -857,11 +851,12 @@ def generate_3way_mpcc_comparison_figure(
     wp = scen["wp_arr"]
     ax_map.plot(wp[:, 0], wp[:, 1], ":", color="#ABB2B9", lw=1.5, label="Tâm quy hoạch A* ($C^2$ B-Spline)", zorder=3)
 
+    n_cp = len(scen["checkpoints_6"])
     plot_keys = ["no_checkpoint", "full"]
     colors = {"no_checkpoint": "#E67E22", "full": "#117864"}
     labels = {
         "no_checkpoint": r"DFE-MPCC (Không Checkpoint, $q_\eta = 0$)",
-        "full": r"DFE-MPCC (Có 6 Checkpoint SPH, $q_\eta = 3.70$ mm)",
+        "full": rf"DFE-MPCC (Có {n_cp} Checkpoint SPH, $q_\eta = 3.70$ mm)",
     }
     lstyles = {"no_checkpoint": "--", "full": "-"}
     lwidths = {"no_checkpoint": 2.0, "full": 2.4}
@@ -871,13 +866,15 @@ def generate_3way_mpcc_comparison_figure(
             tr = np.asarray(records[k]["traj_xy"])
             ax_map.plot(tr[:, 0], tr[:, 1], lstyles[k], color=colors[k], lw=lwidths[k], label=labels[k], zorder=5 if k == "full" else 4)
 
-    for cp in scen["checkpoints_6"]:
+    map_offsets = [(4, 5), (-22, 6), (5, -12), (-24, -12)]
+    for idx_cp, cp in enumerate(scen["checkpoints_6"]):
         cpx, cpy = cp["pos"]
-        ax_map.plot(cpx, cpy, "o", color="#F1C40F", markeredgecolor="#1C2833", markersize=7.5, zorder=7)
+        ox, oy = map_offsets[idx_cp % len(map_offsets)]
+        ax_map.plot(cpx, cpy, "o", color="#F1C40F", markeredgecolor="#1C2833", markersize=7.0, zorder=7)
         ax_map.annotate(
-            cp["name"], xy=(cpx, cpy), xytext=(4, 5), textcoords="offset points",
-            fontsize=8.0, fontweight="bold", color="#1C2833",
-            bbox=dict(boxstyle="round,pad=0.18", fc="#FEF9E7", ec="#B7950B", alpha=0.92, lw=0.7), zorder=8
+            cp["name"], xy=(cpx, cpy), xytext=(ox, oy), textcoords="offset points",
+            fontsize=7.6, fontweight="bold", color="#1C2833",
+            bbox=dict(boxstyle="round,pad=0.16", fc="#FEF9E7", ec="#B7950B", alpha=0.92, lw=0.7), zorder=8
         )
 
     for g_idx, g_d in enumerate(scen["gate_descriptors"]):
@@ -885,15 +882,19 @@ def generate_3way_mpcc_comparison_figure(
         ax_map.plot(bp[0], bp[1], "D", color="#C0392B", markersize=6.8, zorder=7)
         ax_map.annotate(f"D{g_idx+1}", xy=(bp[0], bp[1]), xytext=(-10, -13), textcoords="offset points", fontsize=7.8, fontweight="bold", color="#922B21")
 
-    ax_map.plot(scen["start_pos"][0], scen["start_pos"][1], "s", color="#2980B9", markersize=9, label="Start (-2.25, -2.25)", zorder=8)
-    ax_map.plot(scen["goal_pos"][0], scen["goal_pos"][1], "*", color="#27AE60", markersize=12, label="Goal (+2.25, +2.25)", zorder=8)
-    ax_map.set_xlim(-3.15, 3.15)
-    ax_map.set_ylim(-3.15, 3.15)
+    s0 = scen["start_pos"]
+    g0 = scen["goal_pos"]
+    base_map = scen.get("map_name", "world7.xml")
+    lim_xy = 3.40 if "world8" in base_map.lower() else 3.15
+    ax_map.plot(s0[0], s0[1], "s", color="#2980B9", markersize=9, label=f"Start ({s0[0]:+.2f}, {s0[1]:+.2f})", zorder=8)
+    ax_map.plot(g0[0], g0[1], "*", color="#27AE60", markersize=12, label=f"Goal ({g0[0]:+.2f}, {g0[1]:+.2f})", zorder=8)
+    ax_map.set_xlim(-lim_xy, lim_xy)
+    ax_map.set_ylim(-lim_xy, lim_xy)
     ax_map.set_aspect("equal")
     ax_map.grid(True, linestyle=":", alpha=0.5)
     ax_map.set_xlabel("Tọa độ X [m]", fontsize=9.5, fontweight="bold")
     ax_map.set_ylabel("Tọa độ Y [m]", fontsize=9.5, fontweight="bold")
-    ax_map.set_title(r"(a) Bản đồ world7.xml (Sàn phẳng, $\mu = 0.35$ đồng nhất) & Quỹ đạo", fontsize=9.8, fontweight="bold")
+    ax_map.set_title(rf"(a) Bản đồ {base_map} (Sàn phẳng, $\mu = 0.35$ đồng nhất) & Quỹ đạo", fontsize=9.8, fontweight="bold")
     ax_map.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=2, fontsize=7.2, framealpha=0.95)
 
     # --- Panel (b): Độ dâng sóng sánh mặt thoáng eta(s) ---
@@ -909,15 +910,16 @@ def generate_3way_mpcc_comparison_figure(
     eta_bnd_cl = float(_CAL_BUDGET["eta_bound_cl_mm"])
     ax_eta.axhline(eta_bnd_cl, color="#8E44AD", linestyle="--", lw=1.35, label=f"Bao trên Conformal $\\eta_{{\\mathrm{{bound}}}}^{{\\mathrm{{CL}}}} = {eta_bnd_cl:.2f}$ mm")
     ax_eta.axhline(20.00, color="#566573", linestyle=":", lw=1.1, label="Ngưỡng sóng tuyến tính Stokes (20.00 mm)")
-    for cp in scen["checkpoints_6"]:
+    for idx_cp, cp in enumerate(scen["checkpoints_6"]):
         ax_eta.axvline(cp["s_m"], color="#BDC3C7", linestyle=":", lw=0.9)
-        ax_eta.text(cp["s_m"], max_eta_plot * 0.94, cp["name"], ha="center", va="top", fontsize=7.5, fontweight="bold", color="#34495E")
+        y_frac = 0.94 - 0.08 * (idx_cp % 2)
+        ax_eta.text(cp["s_m"], max_eta_plot * y_frac, cp["name"], ha="center", va="top", fontsize=7.2, fontweight="bold", color="#34495E")
 
     ax_eta.set_ylabel("Độ dâng sóng $\\eta(s)$ [mm]", fontsize=9.2, fontweight="bold")
     ax_eta.set_ylim(0.0, max_eta_plot)
     ax_eta.grid(True, linestyle=":", alpha=0.6)
     ax_eta.legend(loc="upper right", fontsize=6.6, ncol=2, framealpha=0.94)
-    ax_eta.set_title(r"(b) Đáp ứng độ dâng sóng mặt thoáng $\eta(s)$ qua 6 Checkpoint ($\mu = 0.35$)", fontsize=9.5, fontweight="bold", loc="left")
+    ax_eta.set_title(rf"(b) Đáp ứng độ dâng sóng mặt thoáng $\eta(s)$ qua {n_cp} Checkpoint WCSPH ($\mu = 0.35$)", fontsize=9.5, fontweight="bold", loc="left")
 
     # --- Panel (c): Tải pháp tuyến bánh nhỏ nhất F_z,min(s) ---
     min_fz_plot = 2.0
@@ -972,7 +974,7 @@ def generate_3way_mpcc_comparison_figure(
     ax_vel.set_ylim(-0.02, 0.78)
     ax_vel.grid(True, linestyle=":", alpha=0.6)
     ax_vel.legend(loc="lower right", fontsize=6.8, framealpha=0.93)
-    ax_vel.set_title("(d) Hồ sơ vận tốc $v(s)$: Ống KM + 6 Checkpoint WCSPH vs. Không Checkpoint", fontsize=9.4, fontweight="bold", loc="left")
+    ax_vel.set_title(f"(d) Hồ sơ vận tốc $v(s)$: Ống KM + {n_cp} Checkpoint WCSPH vs. Không Checkpoint", fontsize=9.4, fontweight="bold", loc="left")
 
     fig.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.08, hspace=0.36, wspace=0.22)
     os.makedirs(os.path.dirname(out_png_path), exist_ok=True)
@@ -991,16 +993,210 @@ def generate_3way_mpcc_comparison_figure(
         plt.close(fig)
 
 
+def _normalize_map_list(map_arg: str, all_maps: bool = False) -> list:
+    """Chuẩn hóa danh sách bản đồ từ --map hoặc --all-maps (mặc định 3 map: world6, world7, world8)."""
+    default_three = ["world6.xml", "world7.xml", "world8.xml"]
+    if all_maps:
+        return default_three
+    raw = (map_arg or "world7.xml").strip()
+    if raw.lower() in ("all", "3maps", "all3"):
+        return default_three
+    items = []
+    for tok in raw.split(","):
+        t = tok.strip().lower()
+        if not t:
+            continue
+        if not t.endswith(".xml"):
+            t = f"{t}.xml"
+        items.append(t)
+    return items or ["world7.xml"]
+
+
+def _resolve_map_artifacts(base_name: str) -> dict:
+    """
+    Trả về đường dẫn file artifact theo từng bản đồ:
+      - Giữ nguyên benchmark_world7_records.json / hinh_so_sanh_3_mpcc_world7.png cho world7.xml.
+      - Dùng ros2_benchmark_<map>_records.json cho world6/world8 để không ghi đè dữ liệu benchmark offline.
+    """
+    map_stem = os.path.splitext(os.path.basename(base_name).lower())[0]
+    out_dir = os.path.join(PROJECT_DIR, "bao cao")
+    cp_json_path = os.path.join(out_dir, f"checkpoints_{map_stem}.json")
+    if map_stem == "world7":
+        cache_path = os.path.join(out_dir, "benchmark_world7_records.json")
+        out_png = os.path.join(out_dir, "hinh_so_sanh_3_mpcc_world7.png")
+    else:
+        cache_path = os.path.join(out_dir, f"ros2_benchmark_{map_stem}_records.json")
+        out_png = os.path.join(out_dir, f"hinh_so_sanh_ros2_mpcc_{map_stem}.png")
+    return {
+        "map_stem": map_stem,
+        "cp_json_path": cp_json_path,
+        "cache_path": cache_path,
+        "out_png": out_png,
+    }
+
+
+def _build_wslg_rviz_env() -> dict:
+    """Cấu hình biến môi trường X11/OpenGL ổn định cho RViz2 trên WSL2 / WSLg."""
+    env = os.environ.copy()
+    if not env.get("DISPLAY"):
+        env["DISPLAY"] = ":0"
+    env.pop("WAYLAND_DISPLAY", None)
+    env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    env["QT_QPA_PLATFORM"] = "xcb"
+    return env
+
+
+def _load_or_build_tube_and_checkpoints(
+    scen: dict,
+    ros_node,
+    cp_json_path: str,
+    recompute_wcsph: bool = False,
+):
+    """
+    Nạp Checkpoint WCSPH Hybrid B+A từ file JSON có sẵn (<0.1 s để RViz2 chạy tức thì)
+    hoặc tính lại 200-step WCSPH khi chưa có cache / người dùng truyền --recompute-wcsph.
+    Đồng thời dựng CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05) cho lượt Có Checkpoint.
+    """
+    wp_arr = scen["wp_arr"]
+    path_s = scen["path_s"]
+    base_name = scen["map_name"]
+
+    has_cached_cp = False
+    cached_cps = []
+    if not recompute_wcsph and os.path.exists(cp_json_path):
+        try:
+            with open(cp_json_path, "r", encoding="utf-8") as f_cp:
+                cp_data = json.load(f_cp)
+            raw_cps = cp_data.get("checkpoints", [])
+            if raw_cps:
+                for idx_c, cp_item in enumerate(raw_cps):
+                    cp_copy = dict(cp_item)
+                    cp_copy.setdefault("name", f"CP{idx_c + 1}")
+                    cp_copy.setdefault("desc", "checkpoint")
+                    cp_copy["R_mm"] = float(cp_copy.get("R_mm", cp_copy.get("residual_R_mm", 0.0)))
+                    cached_cps.append(cp_copy)
+                has_cached_cp = True
+        except Exception:
+            cached_cps = []
+            has_cached_cp = False
+
+    run_wcsph_now = bool(recompute_wcsph or not has_cached_cp)
+    tube_planner = None
+    try:
+        from velocity_tube_h124 import CoupledVelocityTubeH124
+        mode_tag = "TÍNH LẠI WCSPH HYBRID B+A" if run_wcsph_now else "NẠP NHANH CACHE CHECKPOINT + ỐNG H124"
+        print(f"\n>>> [GIAI ĐOẠN A - t=0]: {mode_tag} ({base_name}, MU=0.35)...")
+        n_wps = len(wp_arr)
+        mu_wps = np.full(n_wps, 0.35, dtype=float)
+        camber_wps = np.zeros(n_wps, dtype=float)
+        zc_wps = np.full(n_wps, 0.0555, dtype=float)
+        d_net_wps = np.full(n_wps, 0.42, dtype=float)
+
+        tube_planner = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
+        tube_summary = tube_planner.build_offline_tube(
+            wp_arr,
+            mu_profile=lambda s_val: float(np.interp(s_val, path_s, mu_wps)),
+            phi_camber_profile=lambda s_val: float(np.interp(s_val, path_s, camber_wps)),
+            z_com_profile=lambda s_val: float(np.interp(s_val, path_s, zc_wps)),
+            d_net_profile=lambda s_val: float(np.interp(s_val, path_s, d_net_wps)),
+            run_wcsph_check=run_wcsph_now,
+        )
+        print(f"  [✓] Ống vận tốc đã hội tụ sau {tube_summary['n_fp_iters']} vòng lặp! Phần dư ||T(v)-v||_inf = {tube_summary['fp_unrelaxed_residual']:.6f} m/s")
+        print(f"  [✓] Chiều dài quỹ đạo chuẩn L: {tube_summary['path_length_m']:.2f} m ({tube_summary['n_grid']} điểm lưới, ds = {tube_summary['ds_m']:.3f} m)")
+        print(f"  [✓] Biên trần vận tốc khả thi: v_ub in [{tube_planner.v_ub_nom.min():.2f}, {tube_planner.v_ub_nom.max():.2f}] m/s")
+
+        if has_cached_cp and not run_wcsph_now:
+            cp_list = cached_cps
+            print(f"  [✓] Đã nạp {len(cp_list)} Checkpoint WCSPH từ cache: {os.path.basename(cp_json_path)} (bỏ qua 400s chạy lặp lại; dùng --recompute-wcsph để tính lại).")
+        else:
+            scale_s = float(path_s[-1]) / max(float(tube_planner.s_grid[-1]), 1e-6)
+            cp_list = []
+            for cp in tube_planner.checkpoints:
+                idx_p = int(cp["idx_peak"])
+                s_mapped = float(cp["s_peak"]) * scale_s
+                cp_list.append({
+                    "cp_id": int(cp["cp_id"]),
+                    "name": f"CP{int(cp['cp_id'])}",
+                    "desc": str(cp["type"]),
+                    "s_m": round(s_mapped, 3),
+                    "s_tube_m": round(float(cp["s_peak"]), 3),
+                    "pos": [round(float(tube_planner.x_grid[idx_p]), 4), round(float(tube_planner.y_grid[idx_p]), 4)],
+                    "kappa_peak": round(float(cp["kappa_peak"]), 4),
+                    "v_ub_cp": round(float(cp.get("v_ub_cp", 0.0)), 3),
+                    "eta_wcsph_t2_mm": round(float(cp.get("eta_wcsph_t2_mm", 0.0)), 2),
+                    "eta_rom_corr_t2_mm": round(float(cp.get("eta_rom_corr_t2_mm", 0.0)), 2),
+                    "R_mm": round(float(cp.get("raw_residual_R_mm", cp.get("residual_R_mm", 0.0))), 2),
+                    "residual_R_mm": round(float(cp.get("raw_residual_R_mm", cp.get("residual_R_mm", 0.0))), 2),
+                })
+            if cp_list:
+                os.makedirs(os.path.dirname(cp_json_path), exist_ok=True)
+                with open(cp_json_path, "w", encoding="utf-8") as f_cp_out:
+                    json.dump({
+                        "map_file": f"xml/{base_name}",
+                        "wcsph_engine": "Hybrid B+A (CoupledVelocityTubeH124, dp=0.005 m)",
+                        "n_checkpoints": len(cp_list),
+                        "wcsph_summary": tube_summary.get("wcsph_summary", {}),
+                        "checkpoints": cp_list,
+                    }, f_cp_out, indent=2, ensure_ascii=False)
+                print(f"  [✓] Đã kiểm tra WCSPH & lưu {len(cp_list)} Checkpoint ra: {cp_json_path}")
+
+        if cp_list:
+            scen["checkpoints_6"] = cp_list
+            if ros_node is not None:
+                ros_node.checkpoints_6 = cp_list
+    except Exception as e:
+        print(f"  [!] Cảnh báo không thể nạp CoupledVelocityTubeH124: {e}")
+
+    return tube_planner
+
+
+def publish_map_transition_banner(ros_node, next_map: str, pause_sec: float = 2.5):
+    """Hiển thị banner chuyển bản đồ trên RViz2 khi đối chứng liên tiếp nhiều đấu trường."""
+    if not HAS_RCLPY or ros_node is None:
+        return
+    now = ros_node.get_clock().now().to_msg()
+    ma = MarkerArray()
+    m_inter = Marker()
+    m_inter.header.stamp = now
+    m_inter.header.frame_id = "map"
+    m_inter.ns = "intermission_hud"
+    m_inter.id = 200
+    m_inter.type = Marker.TEXT_VIEW_FACING
+    m_inter.action = Marker.ADD
+    m_inter.pose.position.x = 0.0
+    m_inter.pose.position.y = 0.0
+    m_inter.pose.position.z = 1.85
+    m_inter.pose.orientation.w = 1.0
+    m_inter.scale.z = 0.22
+    m_inter.color = ColorRGBA(r=0.35, g=0.88, b=1.0, a=1.0)
+    m_inter.text = f"ĐANG CHUYỂN SANG ĐẤU TRƯỜNG TIẾP THEO:\n>>> {next_map.upper()} (Không CP vs. Có CP WCSPH) <<<"
+    ma.markers.append(m_inter)
+    ros_node.marker_pub.publish(ma)
+
+    t0 = time.time()
+    while time.time() - t0 < pause_sec:
+        rclpy.spin_once(ros_node, timeout_sec=0.05)
+        time.sleep(0.05)
+
+
 def run_sequential_3way_benchmark(
     map_name: str = "world7.xml",
     variant_choice: str = "all",
     launch_rviz: bool = True,
-    max_time: float = 54.0,
+    max_time: float = None,
     speed_factor: float = 1.0,
     enable_plot: bool = False,
+    recompute_wcsph: bool = False,
+    existing_rclpy: bool = False,
+    existing_rviz_proc=None,
+    keep_rviz_alive: bool = False,
 ):
     scen = build_map_scenario(map_name)
     base_name = scen["map_name"]
+    if max_time is None:
+        max_time = 60.0 if "world8" in base_name.lower() else 54.0
+
+    artifacts = _resolve_map_artifacts(base_name)
     model = scen["model"]
     start_pos = scen["start_pos"]
     goal_pos = scen["goal_pos"]
@@ -1012,13 +1208,13 @@ def run_sequential_3way_benchmark(
     checkpoints_6 = scen["checkpoints_6"]
 
     print("=" * 112)
-    print(f"  ĐỐI CHỨNG 2 CẤU HÌNH DFE-MPCC (KHÔNG CHECKPOINT vs. CÓ 6 CHECKPOINT SPH) | BẢN ĐỒ: {base_name.upper()}")
+    print(f"  ĐỐI CHỨNG 2 CẤU HÌNH DFE-MPCC (KHÔNG CHECKPOINT vs. CÓ CHECKPOINT WCSPH HYBRID B+A) | BẢN ĐỒ: {base_name.upper()}")
     print(f"  Quỹ đạo A*: L = {path_s[-1]:.3f} m ({len(wp_arr)} waypoints) | Ma sát đồng nhất mu = 0.35 | 4 Vật cản động")
     print(f"  Chế độ chạy: variant = '{variant_choice}' | max_time = {max_time:.1f} s | speed = {speed_factor}x")
     print("=" * 112)
 
     has_ros = bool(HAS_RCLPY and rclpy is not None)
-    if has_ros:
+    if has_ros and not existing_rclpy:
         rclpy.init()
     ros_node = SimpatRos2RvizHeadlessNode(
         map_name=base_name,
@@ -1033,36 +1229,36 @@ def run_sequential_3way_benchmark(
     )
     if has_ros:
         ros_node.clear_old_markers()
+        ros_node.robot_traj_msg.poses.clear()
 
-    rviz_proc = None
+    rviz_proc = existing_rviz_proc
     if has_ros and launch_rviz:
-        rviz_cfg_path = os.path.join(PROJECT_DIR, "config", "simpat_rviz2.rviz")
-        print(f">>> Đang khởi chạy giao diện đồ họa ROS 2 RViz2 ({rviz_cfg_path})...")
-        env = os.environ.copy()
-        if "DISPLAY" not in env or not env["DISPLAY"]:
-            env["DISPLAY"] = ":0"
-        try:
-            rviz_proc = subprocess.Popen(
-                ["rviz2", "-d", rviz_cfg_path],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print("  [✓] Cửa sổ RViz2 đã kích hoạt! Đợi 2.5 giây để đồng bộ bản đồ & tháp cảm biến...")
-            for _ in range(12):
-                ros_node.static_map_msg.header.stamp = ros_node.get_clock().now().to_msg()
-                ros_node.map_pub.publish(ros_node.static_map_msg)
-                ros_node.global_plan_msg.header.stamp = ros_node.get_clock().now().to_msg()
-                ros_node.plan_pub.publish(ros_node.global_plan_msg)
-                rclpy.spin_once(ros_node, timeout_sec=0.05)
-                time.sleep(0.20)
-        except Exception as e:
-            print(f"  [!] Cảnh báo không thể mở rviz2 tự động: {e}")
+        if rviz_proc is None or rviz_proc.poll() is not None:
+            rviz_cfg_path = os.path.join(PROJECT_DIR, "config", "simpat_rviz2.rviz")
+            print(f">>> Đang khởi chạy giao diện đồ họa ROS 2 RViz2 ({rviz_cfg_path})...")
+            env = _build_wslg_rviz_env()
+            try:
+                rviz_proc = subprocess.Popen(
+                    ["rviz2", "-d", rviz_cfg_path],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print("  [✓] Cửa sổ RViz2 đã kích hoạt! Đợi 2.5 giây để đồng bộ bản đồ & tháp cảm biến...")
+            except Exception as e:
+                print(f"  [!] Cảnh báo không thể mở rviz2 tự động: {e}")
+
+        for _ in range(12):
+            ros_node.static_map_msg.header.stamp = ros_node.get_clock().now().to_msg()
+            ros_node.map_pub.publish(ros_node.static_map_msg)
+            ros_node.global_plan_msg.header.stamp = ros_node.get_clock().now().to_msg()
+            ros_node.plan_pub.publish(ros_node.global_plan_msg)
+            rclpy.spin_once(ros_node, timeout_sec=0.05)
+            time.sleep(0.20)
 
     lidar = Lidar(model)
 
-    # File cache dữ liệu các lượt chạy (JSON)
-    cache_path = os.path.join(PROJECT_DIR, "bao cao", "benchmark_world7_records.json")
+    cache_path = artifacts["cache_path"]
     cached_records = {}
     if os.path.exists(cache_path):
         try:
@@ -1079,48 +1275,20 @@ def run_sequential_3way_benchmark(
 
     records = dict(cached_records)
 
-    # GIAI ĐOẠN A (t = 0): Quy hoạch Ống vận tốc khả thi bậc 3 Krasnoselskii-Mann từ planning/velocity_tube_h124.py
-    tube_planner = None
-    try:
-        from velocity_tube_h124 import CoupledVelocityTubeH124
-        print("\n>>> [GIAI ĐOẠN A - t=0]: QUY HOẠCH ỐNG VẬN TỐC KHẢ THI BẬC 3 (KRASNOSELSKII-MANN, MU=0.35, 6 CHECKPOINTS SPH)...")
-        n_wps = len(wp_arr)
-        mu_wps = np.full(n_wps, 0.35, dtype=float)
-        camber_wps = np.zeros(n_wps, dtype=float)
-        zc_wps = np.full(n_wps, 0.0555, dtype=float)
-        d_net_wps = np.full(n_wps, 0.42, dtype=float)
-
-        def mu_profile_fn(s_val):
-            return float(np.interp(s_val, path_s, mu_wps))
-
-        def camber_profile_fn(s_val):
-            return float(np.interp(s_val, path_s, camber_wps))
-
-        def zc_profile_fn(s_val):
-            return float(np.interp(s_val, path_s, zc_wps))
-
-        def dnet_profile_fn(s_val):
-            return float(np.interp(s_val, path_s, d_net_wps))
-
-        tube_planner = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
-        tube_summary = tube_planner.build_offline_tube(
-            wp_arr,
-            mu_profile=mu_profile_fn,
-            phi_camber_profile=camber_profile_fn,
-            z_com_profile=zc_profile_fn,
-            d_net_profile=dnet_profile_fn,
-            run_wcsph_check=True,
-        )
-        print(f"  [✓] Ống vận tốc đã hội tụ sau {tube_summary['n_fp_iters']} vòng lặp! Phần dư ||T(v)-v||_inf = {tube_summary['fp_unrelaxed_residual']:.6f} m/s")
-        print(f"  [✓] Chiều dài quỹ đạo chuẩn L: {tube_summary['path_length_m']:.2f} m ({tube_summary['n_grid']} điểm lưới, ds = {tube_summary['ds_m']:.3f} m)")
-        print(f"  [✓] Biên trần vận tốc khả thi: v_ub in [{tube_planner.v_ub_nom.min():.2f}, {tube_planner.v_ub_nom.max():.2f}] m/s")
-        print(f"  [✓] Đã kích hoạt 4 nút thắt vật lý + kiểm tra WCSPH tại {tube_summary['n_checkpoints']} Checkpoint (max_eta_wcsph = {tube_summary['max_eta_wcsph_mm']:.2f} mm)!")
-    except Exception as e:
-        print(f"  [!] Cảnh báo không thể nạp CoupledVelocityTubeH124: {e}")
+    tube_planner = _load_or_build_tube_and_checkpoints(
+        scen=scen,
+        ros_node=ros_node,
+        cp_json_path=artifacts["cp_json_path"],
+        recompute_wcsph=recompute_wcsph,
+    )
+    checkpoints_6 = scen["checkpoints_6"]
 
     total_runs = len(variants_to_run)
     for idx, v_key in enumerate(variants_to_run):
+        if rviz_proc is not None and rviz_proc.poll() is not None:
+            break
         run_idx = idx + 1
+        baseline_trail = records.get("no_checkpoint", {}).get("traj_xy") if v_key == "full" else None
         res = run_single_variant_simulation(
             variant_key=v_key,
             run_idx=run_idx,
@@ -1131,7 +1299,8 @@ def run_sequential_3way_benchmark(
             max_time=max_time,
             speed_factor=speed_factor,
             rviz_proc=rviz_proc,
-            tube_planner=tube_planner,
+            tube_planner=(tube_planner if v_key == "full" else None),
+            baseline_traj_xy=baseline_trail,
         )
         records[v_key] = res
 
@@ -1150,13 +1319,15 @@ def run_sequential_3way_benchmark(
 
     # Lưu kết quả chạy vào cache JSON
     try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2)
+        print(f"\n  [✓] Đã lưu bản ghi chạy ROS 2 tại: {cache_path}")
     except Exception as e:
         print(f"  [!] Lỗi ghi file cache JSON: {e}")
 
-    # Xuất đồ thị đối chứng 4-panel nếu đã có ít nhất 1 bản ghi
-    out_png = os.path.join(PROJECT_DIR, "bao cao", "hinh_so_sanh_3_mpcc_world7.png")
+    # Xuất đồ thị đối chứng 4-panel
+    out_png = artifacts["out_png"]
     generate_3way_mpcc_comparison_figure(scen, records, out_png, show_plot=enable_plot, tube_planner=tube_planner)
 
     # Bảng tổng kết đối chứng định lượng
@@ -1196,16 +1367,106 @@ def run_sequential_3way_benchmark(
 
     if has_ros:
         ros_node.destroy_node()
-        if launch_rviz and rviz_proc is not None and rviz_proc.poll() is None:
-            print("\n  [i] Giữ cửa sổ RViz2 thêm 5 giây để bạn quan sát lần cuối...")
-            time.sleep(5.0)
-            rviz_proc.terminate()
-        rclpy.shutdown()
+        if not keep_rviz_alive:
+            if launch_rviz and rviz_proc is not None and rviz_proc.poll() is None:
+                print("\n  [i] Giữ cửa sổ RViz2 thêm 5 giây để bạn quan sát lần cuối...")
+                time.sleep(5.0)
+                rviz_proc.terminate()
+            if not existing_rclpy:
+                rclpy.shutdown()
+
+    return records, rviz_proc
+
+
+def run_multi_map_3way_benchmark(
+    map_list: list,
+    variant_choice: str = "all",
+    launch_rviz: bool = True,
+    max_time: float = None,
+    speed_factor: float = 1.0,
+    enable_plot: bool = False,
+    recompute_wcsph: bool = False,
+):
+    """Chạy nối tiếp đối chứng 2 phiên bản MPCC trên nhiều bản đồ trong cùng 1 cửa sổ RViz2."""
+    has_ros = bool(HAS_RCLPY and rclpy is not None)
+    if has_ros:
+        rclpy.init()
+
+    rviz_proc = None
+    all_records = {}
+    multi_mode = len(map_list) > 1
+
+    try:
+        for idx_m, m_name in enumerate(map_list):
+            if rviz_proc is not None and rviz_proc.poll() is not None:
+                print("\n  [!] Người dùng đã đóng cửa sổ RViz2. Dừng chuỗi đa bản đồ.")
+                break
+
+            is_last = (idx_m == len(map_list) - 1)
+            rec_m, rviz_proc = run_sequential_3way_benchmark(
+                map_name=m_name,
+                variant_choice=variant_choice,
+                launch_rviz=launch_rviz,
+                max_time=max_time,
+                speed_factor=speed_factor,
+                enable_plot=(enable_plot and not multi_mode),
+                recompute_wcsph=recompute_wcsph,
+                existing_rclpy=has_ros,
+                existing_rviz_proc=rviz_proc,
+                keep_rviz_alive=(not is_last),
+            )
+            all_records[m_name] = rec_m
+
+            if has_ros and not is_last and (rviz_proc is None or rviz_proc.poll() is None):
+                scen_next = build_map_scenario(map_list[idx_m + 1])
+                tmp_node = SimpatRos2RvizHeadlessNode(
+                    map_name=scen_next["map_name"],
+                    model=scen_next["model"],
+                    waypoints=scen_next["wp_arr"],
+                    obs_boxes=scen_next["obs_boxes"],
+                    obs_circles=scen_next["obs_circles"],
+                    map_geoms=scen_next["map_geoms"],
+                    checkpoints_6=scen_next["checkpoints_6"],
+                    start_pos=scen_next["start_pos"],
+                    goal_pos=scen_next["goal_pos"],
+                )
+                tmp_node.clear_old_markers()
+                publish_map_transition_banner(tmp_node, map_list[idx_m + 1], pause_sec=2.5)
+                tmp_node.destroy_node()
+    finally:
+        if has_ros and rclpy.ok():
+            if rviz_proc is not None and rviz_proc.poll() is None:
+                rviz_proc.terminate()
+            rclpy.shutdown()
+
+    if len(all_records) > 1:
+        print("\n" + "=" * 122)
+        print("  TỔNG HỢP ĐỐI CHỨNG 2 PHIÊN BẢN DFE-MPCC TRÊN TẤT CẢ BẢN ĐỒ (MU = 0.35 ĐỒNG NHẤT)")
+        print("=" * 122)
+        for m_name, recs in all_records.items():
+            for k in ["no_checkpoint", "full"]:
+                if k in recs:
+                    st = recs[k]
+                    print(
+                        f"  {m_name:<10} | {VARIANT_META[k]['short_name']:<28} | "
+                        f"eta_max={st['max_eta']:5.2f} mm | Fz_min={st['min_fz']:5.2f} N | "
+                        f"d_dyn={float(st.get('min_dyn', 1.0)):+5.2f} m | T={st['t_finish_s']:5.2f} s | "
+                        f"done={st.get('finished', False)}"
+                    )
+        print("=" * 122)
+
+    return all_records
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chạy đối chứng 2 cấu hình DFE-MPCC (Không vs Có Checkpoint SPH) trên World 7 (mu = 0.35 đồng nhất)")
-    parser.add_argument("--map", type=str, default="world7.xml", help="Bản đồ đối chứng (mặc định: world7.xml)")
+    parser = argparse.ArgumentParser(description="Chạy đối chứng 2 cấu hình DFE-MPCC (Không vs Có Checkpoint SPH) trên World 6/7/8 (mu = 0.35)")
+    parser.add_argument(
+        "--map",
+        type=str,
+        default="world7.xml",
+        help="Bản đồ đối chứng: world6.xml, world7.xml, world8.xml, 'all' hoặc danh sách cách nhau dấu phẩy (mặc định: world7.xml)",
+    )
+    parser.add_argument("--all-maps", action="store_true", help="Chạy tuần tự cả 3 bản đồ (world6.xml, world7.xml, world8.xml) trong 1 cửa sổ RViz2")
     parser.add_argument(
         "--variant",
         type=str,
@@ -1214,33 +1475,72 @@ if __name__ == "__main__":
         help="Biến thể cần chạy: 'all' (2 lượt tuần tự), 'no_checkpoint', 'full'",
     )
     parser.add_argument("--no-rviz", action="store_true", help="Chạy xuất số liệu & đồ thị nhanh không bật cửa sổ RViz2")
-    parser.add_argument("--plot", action="store_true", default=True, help="Hiển thị cửa sổ đồ thị đối chứng 4-panel sau khi chạy test xong (mặc định: bật)")
+    parser.add_argument("--plot", action="store_true", default=True, help="Hiển thị cửa sổ đồ thị đối chứng 4-panel sau khi chạy (khi chạy 1 map có DISPLAY)")
     parser.add_argument("--no-plot", action="store_true", help="Không mở cửa sổ đồ thị sau khi chạy (chỉ lưu file ảnh PNG)")
-    parser.add_argument("--time", type=float, default=54.0, help="Thời gian mô phỏng tối đa cho mỗi lượt (s)")
-    parser.add_argument("--speed", type=float, default=1.0, help="Tốc độ mô phỏng thời gian thực")
+    parser.add_argument("--time", type=float, default=None, help="Thời gian mô phỏng tối đa cho mỗi lượt (mặc định: 54s cho world6/7, 60s cho world8)")
+    parser.add_argument("--speed", type=float, default=1.0, help="Tốc độ mô phỏng thời gian thực (vd: 2.0 để xem nhanh gấp đôi)")
+    parser.add_argument("--recompute-wcsph", action="store_true", help="Ép chạy lại mô phỏng hạt WCSPH offline (~400-600s/map) thay vì dùng cache JSON có sẵn")
     parser.add_argument("--replot-only", action="store_true", help="Chỉ vẽ lại đồ thị đối chứng từ dữ liệu cache mà không cần chạy lại mô phỏng")
     args = parser.parse_args()
 
     launch_plot = not args.no_plot
+    target_maps = _normalize_map_list(args.map, all_maps=args.all_maps)
 
     if args.replot_only:
-        print(f">>> [REPLOT-ONLY]: Đang nạp kịch bản {args.map} và cache benchmark_world7_records.json...")
-        scen = build_map_scenario(args.map)
-        cache_path = os.path.join(PROJECT_DIR, "bao cao", "benchmark_world7_records.json")
-        if not os.path.exists(cache_path):
-            raise FileNotFoundError(f"Không tìm thấy file cache: {cache_path}")
-        with open(cache_path, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        out_png = os.path.join(PROJECT_DIR, "bao cao", "hinh_so_sanh_3_mpcc_world7.png")
-        generate_3way_mpcc_comparison_figure(scen, records, out_png, show_plot=launch_plot)
-        print(f">>> [REPLOT-ONLY] Hoàn tất xuất bản đồ thị 4-panel đối chứng tại: {out_png}")
+        for m_name in target_maps:
+            scen = build_map_scenario(m_name)
+            artifacts = _resolve_map_artifacts(scen["map_name"])
+            print(f">>> [REPLOT-ONLY]: Đang nạp kịch bản {scen['map_name']} và cache {os.path.basename(artifacts['cache_path'])}...")
+            if os.path.exists(artifacts["cp_json_path"]):
+                with open(artifacts["cp_json_path"], "r", encoding="utf-8") as f_cp:
+                    cp_data = json.load(f_cp)
+                if cp_data.get("checkpoints"):
+                    scen["checkpoints_6"] = cp_data["checkpoints"]
+            if not os.path.exists(artifacts["cache_path"]):
+                raise FileNotFoundError(f"Không tìm thấy file cache: {artifacts['cache_path']}")
+            with open(artifacts["cache_path"], "r", encoding="utf-8") as f:
+                records = json.load(f)
+            tube_replot = None
+            try:
+                from velocity_tube_h124 import CoupledVelocityTubeH124
+                tube_replot = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
+                tube_replot.build_offline_tube(
+                    scen["wp_arr"],
+                    mu_profile=lambda s: 0.35,
+                    phi_camber_profile=lambda s: 0.0,
+                    z_com_profile=lambda s: 0.0555,
+                    d_net_profile=lambda s: 0.42,
+                    run_wcsph_check=False,
+                )
+            except Exception:
+                tube_replot = None
+            generate_3way_mpcc_comparison_figure(
+                scen,
+                records,
+                artifacts["out_png"],
+                show_plot=(launch_plot and len(target_maps) == 1),
+                tube_planner=tube_replot,
+            )
+            print(f">>> [REPLOT-ONLY] Hoàn tất xuất đồ thị 4-panel tại: {artifacts['out_png']}")
         sys.exit(0)
 
-    run_sequential_3way_benchmark(
-        map_name=args.map,
-        variant_choice=args.variant,
-        launch_rviz=(not args.no_rviz),
-        max_time=args.time,
-        speed_factor=args.speed,
-        enable_plot=launch_plot,
-    )
+    if len(target_maps) == 1:
+        run_sequential_3way_benchmark(
+            map_name=target_maps[0],
+            variant_choice=args.variant,
+            launch_rviz=(not args.no_rviz),
+            max_time=args.time,
+            speed_factor=args.speed,
+            enable_plot=launch_plot,
+            recompute_wcsph=args.recompute_wcsph,
+        )
+    else:
+        run_multi_map_3way_benchmark(
+            map_list=target_maps,
+            variant_choice=args.variant,
+            launch_rviz=(not args.no_rviz),
+            max_time=args.time,
+            speed_factor=args.speed,
+            enable_plot=launch_plot,
+            recompute_wcsph=args.recompute_wcsph,
+        )

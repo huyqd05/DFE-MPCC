@@ -50,7 +50,7 @@ import mujoco
 from astar import AStarPlanner
 from dfe_mpcc_amr_controller import DFEMPCCAMRController
 from velocity_tube_h124 import CoupledVelocityTubeH124
-from iso8608_road_profile import ISO8608RoadProfile, get_world8_zone_friction
+from iso8608_road_profile import ISO8608RoadProfile
 from obstacle_injector import create_injected_simulation_model
 from test_sim_amr_closed_loop import (
     extract_map_from_model,
@@ -63,6 +63,7 @@ from robot_model_amr_casadi import (
     M_TOTAL, Z_COM, L_X, L_Y
 )
 from conformal_checkpoint_eval import load_conformal_calibration_budget
+from benchmark_world6_complex_4dyn_obs import compute_world6_slosh_elevation_mm
 
 _CAL_BUDGET = load_conformal_calibration_budget()
 TANK_FREEBOARD = (TANK_H - H_LIQUID) * 1000.0  # 30.0 mm
@@ -176,6 +177,34 @@ def run_benchmark_world8():
     for cp in tube_summary['checkpoints']:
         print(f"       * CP{cp['cp_id']} ({cp['type']}): s = {cp['s_peak']:.2f} m | |kappa| = {abs(cp['kappa_peak']):.2f} | v_ub = {cp['v_ub_cp']:.3f} m/s ({cp['active_regime']})")
 
+    # Lưu thông tin Checkpoint Hybrid B+A của World 8 ra JSON
+    ckpt_w8_path = os.path.join(out_dir, "checkpoints_world8.json")
+    cp_records_w8 = []
+    scale_s_w8 = path_len_total / max(float(tube_planner.s_grid[-1]), 1e-6)
+    for cp in tube_planner.checkpoints:
+        idx_p = int(cp["idx_peak"])
+        cp_records_w8.append({
+            "cp_id": int(cp["cp_id"]),
+            "name": f"CP{int(cp['cp_id'])}",
+            "desc": str(cp["type"]),
+            "s_m": round(float(cp["s_peak"]) * scale_s_w8, 3),
+            "s_tube_m": round(float(cp["s_peak"]), 3),
+            "pos": [round(float(tube_planner.x_grid[idx_p]), 4), round(float(tube_planner.y_grid[idx_p]), 4)],
+            "kappa_peak": round(float(cp["kappa_peak"]), 4),
+            "v_ub_cp": round(float(cp.get("v_ub_cp", 0.0)), 3),
+            "eta_wcsph_t2_mm": round(float(cp.get("eta_wcsph_t2_mm", 0.0)), 2),
+            "eta_rom_corr_t2_mm": round(float(cp.get("eta_rom_corr_t2_mm", 0.0)), 2),
+            "R_mm": round(float(cp.get("raw_residual_R_mm", cp.get("residual_R_mm", 0.0))), 2),
+        })
+    with open(ckpt_w8_path, "w", encoding="utf-8") as f_cp8:
+        json.dump({
+            "map_file": "xml/world8.xml",
+            "wcsph_engine": "Hybrid B+A (CoupledVelocityTubeH124, dp=0.005 m)",
+            "n_checkpoints": len(cp_records_w8),
+            "wcsph_summary": tube_summary.get("wcsph_summary", {}),
+            "checkpoints": cp_records_w8,
+        }, f_cp8, indent=2, ensure_ascii=False)
+
     # 4. Trích xuất cổng giao cắt vật cản động (Gate Crossing Descriptors)
     dyn_geoms = extract_map_from_model(model_sim)[5]
     gate_descriptors = []
@@ -248,6 +277,7 @@ def run_benchmark_world8():
             state_con_mode="skip0",
             mu_plan_scale=0.95,
             ipopt_max_iter=60,
+            h_lim_m=0.020,
         )
         ctrl.set_path(wp_arr)
         if v_key == "full":
@@ -297,7 +327,7 @@ def run_benchmark_world8():
             # Đánh giá kích động nền đường hình học ISO 8608 (ma sát đồng nhất mu = 0.35, friction_variation_scale = 0.0)
             road_eval = road_profile.compute_wheel_loads_and_slosh_excitation(
                 q_meas, v_meas,
-                mu_nominal=get_world8_zone_friction,
+                mu_nominal=0.35,
                 friction_variation_scale=0.0,
             )
             dfz_iso_now = road_eval["dfz_iso_wheels"]
@@ -306,9 +336,9 @@ def run_benchmark_world8():
 
             # Bộ ước lượng trạng thái 3D đồng đẳng cho cả 2 cấu hình
             phi_est = np.array([
-                phi_x_meas + (a_road_body[0] / 9.81) * 0.50,
+                phi_x_meas + (a_road_body[0] / 9.81) * 0.55,
                 dphi_x_meas,
-                phi_y_meas - (a_road_body[1] / 9.81) * 0.50,
+                phi_y_meas - (a_road_body[1] / 9.81) * 0.55,
                 dphi_y_meas,
             ])
             mu_solve = 0.35
@@ -454,9 +484,9 @@ def run_benchmark_world8():
             a_bx = c_th0 * a_act[0] + s_th0 * a_act[1]
             a_by = -s_th0 * a_act[0] + c_th0 * a_act[1]
 
-            # Cập nhật góc con lắc chất lỏng theo gia tốc quán tính thân xe
-            data_sim.qpos[3] = float(np.clip(data_sim.qpos[3] + (a_by / 9.81) * 0.055, -0.22, 0.22))
-            data_sim.qpos[4] = float(np.clip(data_sim.qpos[4] - (a_bx / 9.81) * 0.055, -0.22, 0.22))
+            # Cập nhật góc con lắc chất lỏng theo gia tốc quán tính thân xe + kích động nền đường (thống nhất World 6 & 7)
+            data_sim.qpos[3] = float(np.clip(data_sim.qpos[3] + ((a_by + a_road_body[1]) / 9.81) * 0.08, -0.25, 0.25))
+            data_sim.qpos[4] = float(np.clip(data_sim.qpos[4] - ((a_bx + a_road_body[0]) / 9.81) * 0.08, -0.25, 0.25))
 
             for sub in range(substeps):
                 tau_sub = (sub + 1) * dt_sim
@@ -473,17 +503,18 @@ def run_benchmark_world8():
             v_now = data_sim.qvel[:3].copy()
             v_lin = float(math.hypot(v_now[0], v_now[1]))
 
-            # Tính toán độ dâng sóng Stokes bậc 2 thực tế từ góc lắc và gia tốc quán tính
+            # Tính toán độ dâng sóng mặt thoáng bằng hàm chuẩn hóa thống nhất giữa World 6, 7 và 8
             th_x_act = float(data_sim.qpos[3])
+            dth_x_act = float(data_sim.qvel[3])
             th_y_act = float(data_sim.qpos[4])
-            u_x_act = abs(math.tan(th_x_act)) + 0.35 * abs(a_bx + a_road_body[0]) / 9.81
-            u_y_act = abs(math.tan(th_y_act)) + 0.35 * abs(a_by + a_road_body[1]) / 9.81
-
-            eta_1x = 0.5 * TANK_A * u_x_act * 1000.0
-            eta_1y = 0.5 * TANK_B * u_y_act * 1000.0
-            stokes_x = (np.pi * TANK_A / 8.0) * (u_x_act ** 2) * 1000.0 * 1.52
-            stokes_y = (np.pi * TANK_B / 8.0) * (u_y_act ** 2) * 1000.0 * 1.52
-            eta_now_mm = max(eta_1x + stokes_x, eta_1y + stokes_y) + 0.001 * z_road_mm
+            dth_y_act = float(data_sim.qvel[4])
+            jerk_mag = float(np.linalg.norm(u_opt[:2]))
+            _, _, eta_now_mm = compute_world6_slosh_elevation_mm(
+                th_x_act, dth_x_act, th_y_act, dth_y_act,
+                a_bx, a_by, jerk_mag,
+                a_road_bx=a_road_body[0], a_road_by=a_road_body[1],
+                z_road_mm=z_road_mm,
+            )
 
             # Tính toán phân bổ tải pháp tuyến 4 bánh F_z
             m_pitch = M_TOTAL * abs(a_bx) * Z_COM
@@ -644,6 +675,7 @@ def generate_world8_benchmark_figure(wp_arr, obs_boxes, obs_circles, inj_configs
         ax2.plot(st["t_hist"], st["eta_hist"], color=meta["color"], lw=2.0, ls=meta["ls"], label=f"{meta['short_name']} (max={st['max_eta']:.2f} mm)")
     ax2.axhline(TANK_FREEBOARD, color="red", lw=1.8, ls="--", label="Ngưỡng tràn bồn h_free = 30.0 mm")
     ax2.axhline(CONFORMAL_LIMIT, color="#27AE60", lw=1.5, ls=":", label=f"Bao trên Conformal = {CONFORMAL_LIMIT:.2f} mm")
+    ax2.axhline(20.0, color="#566573", lw=1.1, ls="-.", label="Ngưỡng sóng tuyến tính Stokes = 20.0 mm")
     ax2.set_xlabel("Thời gian t (s)", fontsize=9.5)
     ax2.set_ylabel("Độ dâng sóng eta (mm)", fontsize=9.5)
     ax2.set_ylim([0, max_eta_plot])
