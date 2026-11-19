@@ -71,4 +71,4 @@ python cfd/calibrate_conformal_q_eta.py
 ### 5. ROS 2 Jazzy SiL (WSL / Linux)
 See `setup_wsl_ros2.sh`, `build_controller.sh`, `test_bridge.sh`, and `test_full_system.sh`.
 
-> **Note:** Local reports (`bao cao/`), binary artifacts, scratch scripts, legacy 8-DoF prototypes, and Monte Carlo experiment archives (`_frozen_legacy_monte_carlo/`, 30-seed batch runners) are excluded via `.gitignore`.
+
