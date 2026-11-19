@@ -1,0 +1,242 @@
+{
+  "history_collection": {
+    "n_runs": 15,
+    "n_total_steps": 2775,
+    "n_accepted": 1175,
+    "n_deadzone_skipped": 1600
+  },
+  "n_gp_voxel_support": 79,
+  "gp_fit_time_ms": 11.953,
+  "calibration_alpha_005": {
+    "method": "Trajectory-Level Split Conformal (4-Wheel Min Supremum)",
+    "n_cal": 60,
+    "alpha_mu": 0.05,
+    "target_coverage": 0.95,
+    "k_star": 58,
+    "q_hat_mu": 4.617917,
+    "score_mean": 3.941776,
+    "score_median": 3.888325,
+    "score_max": 4.898847,
+    "lag1_autocorr": -0.01148,
+    "lag1_z_stat": 0.0889,
+    "exchangeability_ok": true,
+    "bonferroni_joint_budget": {
+      "alpha_eta": 0.05,
+      "alpha_fz": 0.025,
+      "alpha_mu_025": 0.025,
+      "alpha_total_with_025": 0.1,
+      "q_hat_mu_at_alpha_025": 4.898847,
+      "k_star_at_alpha_025": 60
+    }
+  },
+  "calibration_alpha_0025": {
+    "method": "Trajectory-Level Split Conformal (4-Wheel Min Supremum)",
+    "n_cal": 60,
+    "alpha_mu": 0.025,
+    "target_coverage": 0.975,
+    "k_star": 60,
+    "q_hat_mu": 4.898847,
+    "score_mean": 3.941776,
+    "score_median": 3.888325,
+    "score_max": 4.898847,
+    "lag1_autocorr": -0.01148,
+    "lag1_z_stat": 0.0889,
+    "exchangeability_ok": true
+  },
+  "test_coverage": {
+    "M0": {
+      "mode": "override",
+      "n_test": 30,
+      "n_traj_covered": 0,
+      "traj_coverage_rate": 0.0,
+      "pointwise_coverage_rate": 0.3607,
+      "clopper_pearson_95_lb": 0.0,
+      "binom_p_value_one_sided": 0.0,
+      "mean_worst_overestimation": 0.20581,
+      "max_worst_overestimation": 0.22199,
+      "mean_conservatism_gap": -0.05477,
+      "max_conservatism_gap": 0.07,
+      "mean_predict_time_ms": 0.0091
+    },
+    "M1": {
+      "mode": "gp_mean",
+      "n_test": 30,
+      "n_traj_covered": 0,
+      "traj_coverage_rate": 0.0,
+      "pointwise_coverage_rate": 0.3922,
+      "clopper_pearson_95_lb": 0.0,
+      "binom_p_value_one_sided": 0.0,
+      "mean_worst_overestimation": 0.13488,
+      "max_worst_overestimation": 0.15601,
+      "mean_conservatism_gap": 0.00015,
+      "max_conservatism_gap": 0.24065,
+      "mean_predict_time_ms": 1.2488
+    },
+    "M2": {
+      "mode": "conformal_lcb",
+      "n_test": 30,
+      "n_traj_covered": 29,
+      "traj_coverage_rate": 0.9667,
+      "pointwise_coverage_rate": 0.9998,
+      "clopper_pearson_95_lb": 0.8514,
+      "binom_p_value_one_sided": 0.7854,
+      "mean_worst_overestimation": 0.00011,
+      "max_worst_overestimation": 0.00341,
+      "mean_conservatism_gap": 0.13919,
+      "max_conservatism_gap": 0.3216,
+      "mean_predict_time_ms": 1.1554
+    }
+  },
+  "tube_summary_30_seeds": {
+    "M0": {
+      "mean_v_min_cp3_m_s": 0.5732,
+      "mean_v_tube_m_s": 0.6234,
+      "mean_plan_time_ms": 212.01,
+      "mean_gp_predict_ms": 0.0
+    },
+    "M1": {
+      "mean_v_min_cp3_m_s": 0.5732,
+      "mean_v_tube_m_s": 0.6234,
+      "mean_plan_time_ms": 215.56,
+      "mean_gp_predict_ms": 2.017
+    },
+    "M2": {
+      "mean_v_min_cp3_m_s": 0.4542,
+      "mean_v_tube_m_s": 0.6125,
+      "mean_plan_time_ms": 257.23,
+      "mean_gp_predict_ms": 2.0231
+    },
+    "M3": {
+      "mean_v_min_cp3_m_s": 0.5706,
+      "mean_v_tube_m_s": 0.623,
+      "mean_plan_time_ms": 233.96,
+      "mean_gp_predict_ms": 0.0
+    }
+  },
+  "closed_loop_mujoco": {
+    "nominal_seed_300": {
+      "M0": {
+        "mode": "M0",
+        "goal_reached": true,
+        "t_finish_s": 12.45,
+        "final_dist_to_goal_m": 0.139,
+        "slip_steps": 0,
+        "total_cycles": 249,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 12.14,
+        "max_contour_err_m": 0.0589,
+        "mean_solve_ms": 174.54,
+        "suboptimal_steps": 0
+      },
+      "M1": {
+        "mode": "M1",
+        "goal_reached": true,
+        "t_finish_s": 12.45,
+        "final_dist_to_goal_m": 0.139,
+        "slip_steps": 0,
+        "total_cycles": 249,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.01,
+        "min_fz_N": 12.14,
+        "max_contour_err_m": 0.0589,
+        "mean_solve_ms": 179.94,
+        "suboptimal_steps": 0
+      },
+      "M2": {
+        "mode": "M2",
+        "goal_reached": true,
+        "t_finish_s": 12.7,
+        "final_dist_to_goal_m": 0.129,
+        "slip_steps": 0,
+        "total_cycles": 254,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 12.14,
+        "max_contour_err_m": 0.0594,
+        "mean_solve_ms": 187.73,
+        "suboptimal_steps": 0
+      },
+      "M3": {
+        "mode": "M3",
+        "goal_reached": true,
+        "t_finish_s": 12.45,
+        "final_dist_to_goal_m": 0.139,
+        "slip_steps": 0,
+        "total_cycles": 249,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 12.14,
+        "max_contour_err_m": 0.0589,
+        "mean_solve_ms": 183.62,
+        "suboptimal_steps": 0
+      }
+    },
+    "adverse_iso_seed_306": {
+      "M0": {
+        "mode": "M0",
+        "goal_reached": true,
+        "t_finish_s": 12.4,
+        "final_dist_to_goal_m": 0.133,
+        "slip_steps": 11,
+        "total_cycles": 248,
+        "slip_rate_pct": 4.44,
+        "max_slip": 0.1482,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 13.03,
+        "max_contour_err_m": 0.0583,
+        "mean_solve_ms": 183.86,
+        "suboptimal_steps": 2
+      },
+      "M1": {
+        "mode": "M1",
+        "goal_reached": true,
+        "t_finish_s": 12.4,
+        "final_dist_to_goal_m": 0.133,
+        "slip_steps": 12,
+        "total_cycles": 248,
+        "slip_rate_pct": 4.84,
+        "max_slip": 0.1624,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 13.03,
+        "max_contour_err_m": 0.0583,
+        "mean_solve_ms": 178.79,
+        "suboptimal_steps": 2
+      },
+      "M2": {
+        "mode": "M2",
+        "goal_reached": true,
+        "t_finish_s": 12.65,
+        "final_dist_to_goal_m": 0.135,
+        "slip_steps": 0,
+        "total_cycles": 253,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 12.85,
+        "max_contour_err_m": 0.065,
+        "mean_solve_ms": 166.57,
+        "suboptimal_steps": 1
+      },
+      "M3": {
+        "mode": "M3",
+        "goal_reached": true,
+        "t_finish_s": 12.4,
+        "final_dist_to_goal_m": 0.14,
+        "slip_steps": 0,
+        "total_cycles": 248,
+        "slip_rate_pct": 0.0,
+        "max_slip": 0.0,
+        "max_eta_mm": 10.02,
+        "min_fz_N": 13.0,
+        "max_contour_err_m": 0.0583,
+        "mean_solve_ms": 179.96,
+        "suboptimal_steps": 2
+      }
+    }
+  }
+}

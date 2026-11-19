@@ -28,9 +28,10 @@ import sys
 for _env_k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_k, "1")
 
+import argparse
 import json
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 import numpy as np
 
@@ -130,7 +131,7 @@ def _select_four_primitive_windows(planner: CoupledVelocityTubeH124, waypoints: 
     s_grid, kappa, dkappa, cps_raw = planner._extract_geometry_and_checkpoints(waypoints)
     n = len(s_grid)
     # Tách theo 4 phần tư dọc tuyến dựa trên cực trị |kappa| nếu bộ lọc hợp nhất chỉ trả < 4 CP
-    corners = [cp for cp in cps_raw if cp.get("type") == "corner_slosh"]
+    corners = [cp for cp in cps_raw if cp.get("type") in ("corner_slosh", "corner")]
     if len(corners) >= 4:
         corners_sorted = sorted(corners, key=lambda c: c["s_peak"])[:4]
         selected = corners_sorted
@@ -329,7 +330,53 @@ def _eval_cal_traj_worker(task_args: tuple) -> list:
     )
 
 
-def run_conformal_calibration_pipeline():
+def _save_cache_atomic(cache_path: str, data: dict):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    tmp_path = cache_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f_c:
+        json.dump(data, f_c, ensure_ascii=False)
+    os.replace(tmp_path, cache_path)
+
+
+def _run_cached_traj_bucket(
+    bucket_key: str,
+    indexed_tasks: list,
+    cache: dict,
+    cache_path: str,
+    max_workers: int,
+    max_new: int,
+    label: str,
+    t0: float,
+):
+    """Chạy các quỹ đạo chưa có trong cache, lưu nguyên tử sau mỗi quỹ đạo."""
+    bucket = cache.setdefault(bucket_key, {})
+    missing = [(idx, task) for idx, task in indexed_tasks if str(idx) not in bucket]
+    if max_new is not None and max_new > 0:
+        to_run = missing[:max_new]
+    elif max_new == 0:
+        to_run = []
+    else:
+        to_run = missing
+
+    ran_cnt = 0
+    if to_run:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            fut_map = {executor.submit(_eval_cal_traj_worker, task): idx for idx, task in to_run}
+            for fut in as_completed(fut_map):
+                idx = fut_map[fut]
+                bucket[str(idx)] = fut.result()
+                _save_cache_atomic(cache_path, cache)
+                ran_cnt += 1
+                print(
+                    f"  [{label}] {len(bucket)}/{len(indexed_tasks)} quỹ đạo (vừa xong idx={idx}) | {time.perf_counter() - t0:.1f} s",
+                    flush=True,
+                )
+
+    is_done = len(bucket) >= len(indexed_tasks)
+    return ran_cnt, is_done
+
+
+def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str = None):
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -343,9 +390,9 @@ def run_conformal_calibration_pipeline():
 
     planner = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
 
-    # Khởi tạo trình giải WCSPH lưới tương xứng dp = 0.010 m (80+120=200 hạt lỏng, dt = 100 us <= 0.50*CFL)
-    dp_cal = 0.010
-    dt_cal = 0.000100
+    # Khởi tạo trình giải WCSPH đồng nhất hoàn toàn với Stage B: dp = 0.005 m (800+486=1286 hạt, dt = 60 us)
+    dp_cal = 0.005
+    dt_cal = 0.000060
     dual_sph = DualSliceWCSPH(Lx=TANK_A, Ly=TANK_B, tank_height=TANK_H, h=H_LIQUID, dp=dp_cal)
     for _ in range(10):
         dual_sph.step(dt_cal, ax=0.0, ay=0.0)
@@ -356,21 +403,47 @@ def run_conformal_calibration_pipeline():
     cw_y = max(0.25, abs(dual_sph.solver_yz.f_wall_2d[0] * dual_sph.Lx) / max(1e-3, dual_sph.bridge.m_fl_total))
     cw_x = max(0.20, abs(dual_sph.solver_xz.f_wall_2d[0] * dual_sph.Ly) / max(1e-3, dual_sph.bridge.m_fl_total))
 
-    max_workers = min(10, os.cpu_count() or 4)
-    print(f"\n[Chuẩn bị] Hybrid B+A (T1=150 ms, T2=90 ms) | dp={dp_cal*1000:.1f} mm, dt={dt_cal*1e6:.0f} us | {max_workers} tiến trình song song")
+    max_workers = min(8, os.cpu_count() or 4)
+    if cache_path is None:
+        cache_path = os.path.join(_root, "config", ".conformal_dp5_cache.json")
+
+    cache = {"dp_cal": dp_cal, "dt_cal": dt_cal, "train": {}, "cal": {}}
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f_c:
+                loaded = json.load(f_c)
+            if abs(float(loaded.get("dp_cal", -1.0)) - dp_cal) < 1e-12 and abs(float(loaded.get("dt_cal", -1.0)) - dt_cal) < 1e-12:
+                cache = loaded
+                print(
+                    f"[Cache] Đã nạp cache tạm từ {os.path.basename(cache_path)}: "
+                    f"train={len(cache.get('train', {}))}/20, cal={len(cache.get('cal', {}))}/50",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[Cache] Bỏ qua cache lỗi ({exc}), khởi tạo mới.", flush=True)
+
+    budget_rem = int(max_new_trajs) if max_new_trajs and max_new_trajs > 0 else None
+    print(f"\n[Chuẩn bị] Hybrid B+A (T1=150 ms, T2=90 ms) | dp={dp_cal*1000:.1f} mm, dt={dt_cal*1e6:.0f} us | {max_workers} tiến trình song song", flush=True)
 
     # Bước 1: Chạy 20 quỹ đạo huấn luyện D_train (80 CP -> 160 điểm T1+T2) để khớp OLS độ chệch tất định b_bar_eta(a/g) & b_bar_Fz(a/g)
     n_train_traj = 20
     rng_train = np.random.default_rng(101)
     train_seeds = rng_train.integers(0, 2**31 - 1, size=n_train_traj)
-    train_tasks = [
-        (dp_cal, dt_cal, cw_x, cw_y, t_i, int(train_seeds[t_i]))
+    train_indexed_tasks = [
+        (t_i, (dp_cal, dt_cal, cw_x, cw_y, t_i, int(train_seeds[t_i])))
         for t_i in range(n_train_traj)
     ]
+    ran_train, train_done = _run_cached_traj_bucket(
+        "train", train_indexed_tasks, cache, cache_path, max_workers, budget_rem, "D_train", t0
+    )
+    if budget_rem is not None:
+        budget_rem = max(0, budget_rem - ran_train)
+    if not train_done:
+        print(f"\n[Tạm dừng theo lô] D_train mới đạt {len(cache['train'])}/{n_train_traj}. Chạy lại lệnh để tiếp tục.", flush=True)
+        return None
     train_recs = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for recs_i in executor.map(_eval_cal_traj_worker, train_tasks):
-            train_recs.extend(recs_i)
+    for t_i in range(n_train_traj):
+        train_recs.extend(cache["train"][str(t_i)])
 
     a_g_train_t1 = np.array([r["a_tot_geom"] / g for r in train_recs], dtype=float)
     e_eta_train_t1 = np.array([r["e_raw_eta_mm"] for r in train_recs], dtype=float)
@@ -412,14 +485,19 @@ def run_conformal_calibration_pipeline():
     alpha = 0.05
     rng_cal = np.random.default_rng(2026)
     cal_seeds = rng_cal.integers(0, 2**31 - 1, size=n_cal_traj)
-    cal_tasks = [
-        (dp_cal, dt_cal, cw_x, cw_y, n_train_traj + t_i, int(cal_seeds[t_i]))
+    cal_indexed_tasks = [
+        (t_i, (dp_cal, dt_cal, cw_x, cw_y, n_train_traj + t_i, int(cal_seeds[t_i])))
         for t_i in range(n_cal_traj)
     ]
+    _, cal_done = _run_cached_traj_bucket(
+        "cal", cal_indexed_tasks, cache, cache_path, max_workers, budget_rem, "D_cal", t0
+    )
+    if not cal_done:
+        print(f"\n[Tạm dừng theo lô] D_cal mới đạt {len(cache['cal'])}/{n_cal_traj}. Chạy lại lệnh để hoàn tất.", flush=True)
+        return None
     cal_recs = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        for recs_i in executor.map(_eval_cal_traj_worker, cal_tasks):
-            cal_recs.extend(recs_i)
+    for t_i in range(n_cal_traj):
+        cal_recs.extend(cache["cal"][str(t_i)])
 
     a_g_t1_cal = np.array([r["a_tot_geom"] / g for r in cal_recs], dtype=float)
     a_g_t2_cal = np.array([r["a_tot_t2_eff_geom"] / g for r in cal_recs], dtype=float)
@@ -485,7 +563,80 @@ def run_conformal_calibration_pipeline():
     q_eta_total_rom_mm = float(round(bias_eta_max_mm + q_eta_rom_mm, 3))
     q_eta_cl_mm = float(round(q_eta_total_rom_mm + q_eta_t2_surge_mm, 3))
 
-    # Bước 5: Neo kiểm chứng bổ sung bằng DualSliceWCSPH mịn 1286 hạt (dp=0.005 m, 180 ms) & RobustWCSPH2D (dp=0.005 m, 160 ms)
+    # Bước 5: Nghiên cứu hội tụ lưới 3 mức Roache GCI (Celik et al., 2008) tại dp in {10.0, 5.0, 3.5} mm + RobustWCSPH2D
+    def _roache_gci_metrics(phi_3_coarse: float, phi_2_med: float, phi_1_fine: float, r32: float, r21: float) -> dict:
+        eps32 = float(phi_3_coarse - phi_2_med)
+        eps21 = float(phi_2_med - phi_1_fine)
+        if abs(eps21) < 1e-12:
+            return {"p_obs": 0.0, "phi_ext_21_mm": float(phi_1_fine), "ea_32_pct": 0.0, "ea_21_pct": 0.0, "gci_32_pct": 0.0, "gci_32_mm": 0.0, "gci_21_pct": 0.0, "gci_21_mm": 0.0}
+        s_sgn = 1.0 if (eps32 / eps21) > 0.0 else -1.0
+        p_cur = 1.5
+        for _ in range(50):
+            num = abs(eps32 / eps21)
+            arg_q = (r21 ** p_cur - s_sgn) / (r32 ** p_cur - s_sgn) if abs(r32 ** p_cur - s_sgn) > 1e-12 else 1.0
+            q_val = np.log(max(1e-12, abs(arg_q)))
+            p_next = abs(np.log(max(1e-12, num)) + q_val) / np.log(r21)
+            p_next = float(np.clip(p_next, 0.2, 6.0))
+            if abs(p_next - p_cur) < 1e-8:
+                p_cur = p_next
+                break
+            p_cur = p_next
+        ea_21 = abs(phi_1_fine - phi_2_med) / max(abs(phi_1_fine), 1e-12)
+        ea_32 = abs(phi_2_med - phi_3_coarse) / max(abs(phi_2_med), 1e-12)
+        phi_ext_21 = (r21 ** p_cur * phi_1_fine - phi_2_med) / max(r21 ** p_cur - 1.0, 1e-12)
+        gci_21 = (1.25 * ea_21) / max(r21 ** p_cur - 1.0, 1e-12)
+        gci_32 = (1.25 * ea_32) / max(r32 ** p_cur - 1.0, 1e-12)
+        return {
+            "p_obs": round(float(p_cur), 4),
+            "phi_ext_21_mm": round(float(phi_ext_21), 4),
+            "ea_32_pct": round(float(ea_32 * 100.0), 3),
+            "ea_21_pct": round(float(ea_21 * 100.0), 3),
+            "gci_32_pct": round(float(gci_32 * 100.0), 3),
+            "gci_32_mm": round(float(gci_32 * abs(phi_2_med)), 4),
+            "gci_21_pct": round(float(gci_21 * 100.0), 3),
+            "gci_21_mm": round(float(gci_21 * abs(phi_1_fine)), 4),
+        }
+
+    gci_levels = []
+    for dp_g, dt_g in [(0.010, 1e-4), (0.005, 6e-5), (0.0035, 4e-5)]:
+        t_g0 = time.perf_counter()
+        sph_g = DualSliceWCSPH(Lx=TANK_A, Ly=TANK_B, tank_height=TANK_H, h=H_LIQUID, dp=dp_g)
+        for _ in range(10):
+            sph_g.step(dt_g, ax=0.0, ay=0.0)
+        ckpt_g = sph_g.save_checkpoint()
+        hyb_g = sph_g.evaluate_hybrid_ba_checkpoint(
+            base_ckpt=ckpt_g, dt=dt_g, ax_exc=0.12, ay_exc=0.91,
+            a_brk_x=-0.35, a_brk_y=-0.32, ay_prev_geom=0.0,
+            gamma_link=0.0, phi_link_rad=0.0, delta_psi_rad=0.80,
+            t1_window_s=0.150, t2_window_s=0.090,
+        )
+        t_gel = time.perf_counter() - t_g0
+        gci_levels.append({
+            "dp_mm": round(dp_g * 1000.0, 2),
+            "dt_us": round(dt_g * 1e6, 1),
+            "n_fluid": int(sph_g.solver_xz.n_fluid + sph_g.solver_yz.n_fluid),
+            "n_total": int(sph_g.solver_xz.n_fluid + sph_g.solver_yz.n_fluid + sph_g.solver_xz.n_bound + sph_g.solver_yz.n_bound),
+            "eta_t1_mm": round(float(hyb_g["eta_wcsph_t1_mm"]), 4),
+            "eta_t2_mm": round(float(hyb_g["eta_wcsph_t2_mm"]), 4),
+            "peak_surf_y_mm": round(float(hyb_g["res_t1"]["peak_eta_surf_y_mm"]), 4),
+            "fy_wall_N": round(float(abs(hyb_g["res_t1"]["peak_fy_wall_N"])), 4),
+            "runtime_s": round(float(t_gel), 2),
+        })
+
+    r32_g = 0.010 / 0.005
+    r21_g = 0.005 / 0.0035
+    gci_t1 = _roache_gci_metrics(gci_levels[0]["eta_t1_mm"], gci_levels[1]["eta_t1_mm"], gci_levels[2]["eta_t1_mm"], r32_g, r21_g)
+    gci_t2 = _roache_gci_metrics(gci_levels[0]["eta_t2_mm"], gci_levels[1]["eta_t2_mm"], gci_levels[2]["eta_t2_mm"], r32_g, r21_g)
+    gci_payload = {
+        "method": "Roache GCI / Celik et al. (2008)",
+        "r32": round(r32_g, 4),
+        "r21": round(r21_g, 4),
+        "levels": gci_levels,
+        "t1_metrics": gci_t1,
+        "t2_metrics": gci_t2,
+    }
+
+    # Neo kiểm chứng bổ sung 180 ms tại dp=0.005 m & RobustWCSPH2D
     sph_fine = DualSliceWCSPH(Lx=TANK_A, Ly=TANK_B, tank_height=TANK_H, h=H_LIQUID, dp=0.005)
     for _ in range(10):
         sph_fine.step(6e-5, ax=0.0, ay=0.0)
@@ -506,6 +657,8 @@ def run_conformal_calibration_pipeline():
     print(f"         k_star = {joint_bounds['k_star']}/{n_cal_samples + 1} | q_eta_ROM = {q_eta_rom_mm:.3f} mm | q_Fz_ROM = {q_fz_rom_N:.3f} N")
     print(f"         q_eta_total_ROM = {q_eta_total_rom_mm:.3f} mm | q_eta_T2_surge = {q_eta_t2_surge_mm:.3f} mm | q_eta_CL = {q_eta_cl_mm:.3f} mm")
     print(f"         k_traj = {joint_bounds['k_traj']}/{n_cal_traj + 1} | q_eta_traj = {joint_bounds['q_eta_traj_mm']:.3f} mm | q_Fz_traj = {joint_bounds['q_fz_traj_N']:.3f} N")
+    print(f"         GCI 3 mức dp in {{10, 5, 3.5}} mm: T1=[{gci_levels[0]['eta_t1_mm']:.3f}, {gci_levels[1]['eta_t1_mm']:.3f}, {gci_levels[2]['eta_t1_mm']:.3f}] mm | p={gci_t1['p_obs']:.2f}, GCI_21={gci_t1['gci_21_pct']:.2f}% ({gci_t1['gci_21_mm']:.3f} mm)")
+    print(f"         GCI T2=[{gci_levels[0]['eta_t2_mm']:.3f}, {gci_levels[1]['eta_t2_mm']:.3f}, {gci_levels[2]['eta_t2_mm']:.3f}] mm | p={gci_t2['p_obs']:.2f}, GCI_21={gci_t2['gci_21_pct']:.2f}% ({gci_t2['gci_21_mm']:.3f} mm)")
     print(f"         Neo kiểm chứng 1286 hạt (dp=5mm, 180 ms): Fy_wall={fy_fine:.4f} N, peak_eta_y={fine_peak_eta_y_mm:.2f} mm | RobustWCSPH2D max_eta={max_eta_robust_mm:.2f} mm")
 
     # Bước 6: Kiểm tra chặn giải tích khởi động nguội (Cold-Start Bound)
@@ -578,10 +731,18 @@ def run_conformal_calibration_pipeline():
             "fy_wall_1286_N": round(fy_fine, 4),
             "robust_wcsph2d_max_eta_mm": round(max_eta_robust_mm, 2),
         },
+        "gci_grid_convergence": gci_payload,
     }
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(cal_payload, f, indent=2, ensure_ascii=False)
+
+    if os.path.exists(cache_path):
+        try:
+            os.remove(cache_path)
+            print(f"[Cache] Đã dọn sạch file tạm: {cache_path}")
+        except OSError:
+            pass
 
     print(f"\n[Bước 4] Xuất thành công cấu hình hiệu chuẩn thực vào: {output_path} ({elapsed_s:.2f} s)")
     print("=" * 80)
@@ -589,4 +750,7 @@ def run_conformal_calibration_pipeline():
 
 
 if __name__ == "__main__":
-    run_conformal_calibration_pipeline()
+    parser = argparse.ArgumentParser(description="Offline Split Conformal & Roache GCI calibration pipeline.")
+    parser.add_argument("--max-new-trajs", type=int, default=0, help="Giới hạn số quỹ đạo mới mỗi lượt chạy (0 = chạy hết).")
+    args = parser.parse_args()
+    run_conformal_calibration_pipeline(max_new_trajs=args.max_new_trajs)

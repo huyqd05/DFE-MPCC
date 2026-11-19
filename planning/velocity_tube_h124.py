@@ -141,6 +141,7 @@ class CoupledVelocityTubeH124:
         enable_traction: bool = True,
         a_y_geom_max: float = 0.875,
         use_exogenous_geom_checkpoint: bool = True,
+        use_physics_cp_constraints: bool = True,
         conformal_cal_path: str = None
     ):
         self.v_max = float(v_max)
@@ -189,6 +190,7 @@ class CoupledVelocityTubeH124:
         self.enable_traction = bool(enable_traction)
         self.a_y_geom_max = float(a_y_geom_max)
         self.use_exogenous_geom_checkpoint = bool(use_exogenous_geom_checkpoint)
+        self.use_physics_cp_constraints = bool(use_physics_cp_constraints)
         self.conformal_cal_path = conformal_cal_path
         self.conformal_lookup_time_ms = 0.0
         self.conformal_dict_meta = {}
@@ -210,6 +212,13 @@ class CoupledVelocityTubeH124:
         self.dkappa_grid = None
         self.dkappa_spline_grid = None
         self.mu_grid = None
+        self.mu_hat_grid = None
+        self.sigma_mu_grid = None
+        self.mu_lcb_grid = None
+        self.mu_is_conformal_safe = False
+        self.mu_effective_plan_scale = self.mu_plan_scale
+        self.friction_predict_time_ms = 0.0
+        self.friction_meta = {}
         self.d_net_grid = None
         self.rho_clr_grid = None
         self.z_com_eff_grid = None
@@ -444,8 +453,117 @@ class CoupledVelocityTubeH124:
                 i += 1
 
         checkpoints = []
-        # Nếu có các khúc cua: Trích xuất từng khúc cua và các điểm uốn chuyển tiếp chữ S giữa các cua ngược chiều
-        if len(corner_regions) > 0:
+        if self.use_physics_cp_constraints and len(corner_regions) > 0:
+            # 4 ràng buộc vật lý - hình học tự thích nghi (kèm NMS tách dấu cùng/ngược)
+            T1y = 2.0 * np.pi / omega_y
+            tau_phase = T1y / 4.0
+            L_consol = L_EFF_YAW + self.v_max * T1y
+            dpsi_min = self.kappa_th * self.v_max * (0.75 * T1y)
+            ds_min_same = L_EFF_YAW + (0.150 + 0.090) * self.v_max + 0.160
+            ds_min_opp = L_EFF_YAW + tau_phase * self.v_max
+            ds_min_cross = 0.160 + 0.060
+
+            # Pha 1: Gộp cụm cua cùng dấu trong ngưỡng L_consol = 0.512 m
+            merged_regs = []
+            for i_s, i_p, i_e in corner_regions:
+                if not merged_regs:
+                    merged_regs.append([i_s, i_p, i_e])
+                else:
+                    prev = merged_regs[-1]
+                    if kappa[prev[1]] * kappa[i_p] > 0 and (s_grid[i_s] - s_grid[prev[2]]) <= L_consol:
+                        eff_p = abs(kappa[prev[1]]) + yaw_arm * abs(dkappa[prev[1]])
+                        eff_c = abs(kappa[i_p]) + yaw_arm * abs(dkappa[i_p])
+                        ip_best = prev[1] if eff_p >= eff_c else i_p
+                        merged_regs[-1] = [prev[0], ip_best, i_e]
+                    else:
+                        merged_regs.append([i_s, i_p, i_e])
+
+            # Pha 2: Lọc bỏ gợn yếu có góc đổi hướng tích lũy < dpsi_min = 0.199 rad
+            valid_corners = []
+            for i_s, i_p, i_e in merged_regs:
+                dpsi = float(np.trapezoid(np.abs(kappa[i_s:i_e + 1]), s_grid[i_s:i_e + 1]))
+                if dpsi >= dpsi_min:
+                    valid_corners.append({
+                        "idx_in": int(i_s),
+                        "idx_peak": int(i_p),
+                        "idx_out": int(i_e),
+                        "s_in": float(s_grid[i_s]),
+                        "s_peak": float(s_grid[i_p]),
+                        "s_out": float(s_grid[i_e]),
+                        "kappa_peak": float(kappa[i_p]),
+                        "dkappa_peak": float(dkappa[i_p]),
+                        "R_min": float(1.0 / max(abs(kappa[i_p]), 1e-6)),
+                        "score": float(abs(kappa[i_p]) + yaw_arm * abs(dkappa[i_p])),
+                    })
+
+            # Pha 3: Lọc NMS tách dấu theo score giảm dần (0.588 m cùng dấu / 0.323 m ngược dấu chicane)
+            kept_corners = []
+            for cand in sorted(valid_corners, key=lambda x: x["score"], reverse=True):
+                ok = True
+                for kc in kept_corners:
+                    req_ds = ds_min_same if (cand["kappa_peak"] * kc["kappa_peak"] > 0) else ds_min_opp
+                    if abs(cand["s_peak"] - kc["s_peak"]) < req_ds:
+                        ok = False
+                        break
+                if ok:
+                    kept_corners.append(cand)
+            kept_corners.sort(key=lambda x: x["s_peak"])
+
+            # Pha 4: Sinh điểm uốn độ giật độc lập giữa hai đỉnh cua ngược dấu đã qua NMS
+            for c_idx, c in enumerate(kept_corners):
+                is_chic = (
+                    (c_idx < len(kept_corners) - 1 and c["kappa_peak"] * kept_corners[c_idx + 1]["kappa_peak"] < 0)
+                    or (c_idx > 0 and c["kappa_peak"] * kept_corners[c_idx - 1]["kappa_peak"] < 0)
+                )
+                checkpoints.append({
+                    "s_sort": float(c["s_peak"]),
+                    "type": "corner_slosh" if is_chic else "corner",
+                    "idx_in": c["idx_in"],
+                    "idx_peak": c["idx_peak"],
+                    "idx_out": c["idx_out"],
+                    "s_in": c["s_in"],
+                    "s_peak": c["s_peak"],
+                    "s_out": c["s_out"],
+                    "kappa_peak": c["kappa_peak"],
+                    "dkappa_peak": c["dkappa_peak"],
+                    "R_min": c["R_min"],
+                    "is_chicane": is_chic,
+                })
+                if c_idx < len(kept_corners) - 1:
+                    nxt = kept_corners[c_idx + 1]
+                    gap = float(nxt["s_in"] - c["s_out"])
+                    if c["kappa_peak"] * nxt["kappa_peak"] < 0 and L_EFF_YAW <= gap <= (self.d_chicane + 0.15):
+                        inf_slice = slice(c["idx_out"], nxt["idx_in"] + 1)
+                        i_inf = c["idx_out"] + int(np.argmax(np.abs(dkappa[inf_slice])))
+                        s_inf = float(s_grid[i_inf])
+                        dk_inf = abs(float(dkappa[i_inf]))
+                        dk_adj = max(abs(c["dkappa_peak"]), abs(nxt["dkappa_peak"]))
+                        if (
+                            dk_inf > dk_adj
+                            and abs(s_inf - c["s_peak"]) >= ds_min_cross
+                            and abs(nxt["s_peak"] - s_inf) >= ds_min_cross
+                        ):
+                            half_w = max(2, int(round(0.08 / self.ds)))
+                            i_inf_in = max(0, i_inf - half_w)
+                            i_inf_out = min(n - 1, i_inf + half_w)
+                            checkpoints.append({
+                                "s_sort": s_inf,
+                                "type": "inflection_jerk",
+                                "idx_in": int(i_inf_in),
+                                "idx_peak": int(i_inf),
+                                "idx_out": int(i_inf_out),
+                                "s_in": float(s_grid[i_inf_in]),
+                                "s_peak": s_inf,
+                                "s_out": float(s_grid[i_inf_out]),
+                                "kappa_peak": float(kappa[i_inf]),
+                                "dkappa_peak": float(dkappa[i_inf]),
+                                "R_min": float(1.0 / max(abs(kappa[i_inf]), 1e-3)),
+                                "is_chicane": True,
+                            })
+            checkpoints.sort(key=lambda cp: cp["s_sort"])
+
+        # Nhánh trích xuất legacy (use_physics_cp_constraints=False) hoặc fallback nếu không còn điểm cua sau lọc
+        if len(checkpoints) == 0 and len(corner_regions) > 0 and not self.use_physics_cp_constraints:
             for c_idx, (i_s, i_p, i_e) in enumerate(corner_regions):
                 is_chic = False
                 if c_idx < len(corner_regions) - 1:
@@ -496,7 +614,24 @@ class CoupledVelocityTubeH124:
                             "R_min": float(1.0 / max(abs(kappa[i_inflect]), 1e-3)),
                             "is_chicane": True
                         })
-        else:
+            checkpoints.sort(key=lambda cp: cp["s_sort"])
+            filtered_cps = []
+            for cand in checkpoints:
+                if not filtered_cps:
+                    filtered_cps.append(cand)
+                else:
+                    prev = filtered_cps[-1]
+                    if abs(cand["s_sort"] - prev["s_sort"]) < 0.20 and cand["type"] == prev["type"]:
+                        if abs(cand["kappa_peak"]) > abs(prev["kappa_peak"]):
+                            filtered_cps[-1] = cand
+                    elif abs(cand["s_sort"] - prev["s_sort"]) < 0.08:
+                        if abs(cand["kappa_peak"]) > abs(prev["kappa_peak"]):
+                            filtered_cps[-1] = cand
+                    else:
+                        filtered_cps.append(cand)
+            checkpoints = filtered_cps
+
+        if len(checkpoints) == 0:
             # Quỹ đạo thẳng hoặc cong rất nhẹ: đặt checkpoint kiểm chứng tại các phân đoạn 1/4, 1/2 và 3/4 chiều dài
             for frac, lbl_t in [(0.25, "accel_zone"), (0.50, "cruise_zone"), (0.75, "decel_zone")]:
                 i_mid = int(round(frac * (n - 1)))
@@ -517,26 +652,7 @@ class CoupledVelocityTubeH124:
                     "R_min": float(1.0 / max(abs(kappa[i_mid]), 1e-6)),
                     "is_chicane": False
                 })
-
-        # Sắp xếp các checkpoint tuần tự theo tọa độ cung s tăng dần
-        checkpoints.sort(key=lambda cp: cp["s_sort"])
-
-        # Lọc khử các checkpoint quá gần nhau, không gộp nhầm các loại checkpoint khác nhau (ví dụ cua vs điểm uốn)
-        filtered_cps = []
-        for cand in checkpoints:
-            if not filtered_cps:
-                filtered_cps.append(cand)
-            else:
-                prev = filtered_cps[-1]
-                if abs(cand["s_sort"] - prev["s_sort"]) < 0.20 and cand["type"] == prev["type"]:
-                    if abs(cand["kappa_peak"]) > abs(prev["kappa_peak"]):
-                        filtered_cps[-1] = cand
-                elif abs(cand["s_sort"] - prev["s_sort"]) < 0.08:
-                    if abs(cand["kappa_peak"]) > abs(prev["kappa_peak"]):
-                        filtered_cps[-1] = cand
-                else:
-                    filtered_cps.append(cand)
-        checkpoints = filtered_cps
+            checkpoints.sort(key=lambda cp: cp["s_sort"])
 
         for idx_k, cp in enumerate(checkpoints):
             cp_id = idx_k + 1
@@ -732,7 +848,7 @@ class CoupledVelocityTubeH124:
         n = len(s_grid)
         abs_k = np.abs(kappa) + 1e-6
         abs_dk = np.abs(dkappa) + 1e-6
-        mu_plan = self.mu_plan_scale * mu_grid
+        mu_plan = self.mu_effective_plan_scale * mu_grid
 
         v_jerk_geom = (self.j_y_max / abs_dk) ** (1.0 / 3.0)
         if self.enable_grip:
@@ -823,7 +939,7 @@ class CoupledVelocityTubeH124:
         """
         abs_k = np.abs(kappa) + 1e-6
         abs_dk = np.abs(dkappa) + 1e-6
-        mu_plan = self.mu_plan_scale * mu_grid
+        mu_plan = self.mu_effective_plan_scale * mu_grid
         n = len(s_grid)
 
         if z_com_eff_grid is None:
@@ -1042,7 +1158,7 @@ class CoupledVelocityTubeH124:
         """
         n = len(s_grid)
         total_len = float(s_grid[-1])
-        mu_plan = self.mu_plan_scale * mu_grid
+        mu_plan = self.mu_effective_plan_scale * mu_grid
 
         a_slosh_x_lim = 0.55 * g * self.theta_allow_x
         if self.enable_grip:
@@ -1325,7 +1441,10 @@ class CoupledVelocityTubeH124:
         delta_warp_profile=None,
         load_transfer_profile=None,
         n_iter: int = None,
-        run_wcsph_check: bool = True
+        run_wcsph_check: bool = True,
+        friction_estimator=None,
+        friction_mode: str = "conformal_lcb",
+        apply_plan_scale: bool = None,
     ) -> dict:
         """
         Thực thi quy hoạch Ống vận tốc khả thi 1 lần trước khi khởi hành (One-Shot Pre-Departure):
@@ -1343,12 +1462,40 @@ class CoupledVelocityTubeH124:
         self.checkpoints = checkpoints
 
         n = len(s_grid)
-        if mu_profile is None:
-            mu_grid = np.full(n, self.mu_default, dtype=float)
-        elif callable(mu_profile):
-            mu_grid = np.array([float(mu_profile(s)) for s in s_grid], dtype=float)
+        if friction_estimator is not None:
+            f_res = friction_estimator.predict_along_path(self.x_grid, self.y_grid, mode=friction_mode)
+            mu_grid = np.asarray(f_res["mu_tube"], dtype=float)
+            self.mu_hat_grid = np.asarray(f_res["mu_mean"], dtype=float)
+            self.sigma_mu_grid = np.asarray(f_res["sigma_gp"], dtype=float)
+            self.mu_lcb_grid = np.asarray(f_res["mu_lcb"], dtype=float)
+            self.mu_is_conformal_safe = bool(f_res.get("is_conformal_safe", False))
+            self.friction_predict_time_ms = float(f_res.get("predict_time_ms", 0.0))
+            self.friction_meta = {
+                "source": type(friction_estimator).__name__,
+                "mode": str(f_res.get("mode", friction_mode)),
+                "q_hat_mu": float(f_res.get("q_hat_mu", 0.0)),
+                "alpha_mu": float(f_res.get("alpha_mu", 0.0)),
+                "n_support": int(f_res.get("n_support", 0)),
+                "predict_time_ms": round(self.friction_predict_time_ms, 4),
+            }
         else:
-            mu_grid = np.asarray(mu_profile, dtype=float)
+            if mu_profile is None:
+                mu_grid = np.full(n, self.mu_default, dtype=float)
+            elif callable(mu_profile):
+                mu_grid = np.array([float(mu_profile(s)) for s in s_grid], dtype=float)
+            else:
+                mu_grid = np.asarray(mu_profile, dtype=float)
+            self.mu_hat_grid = mu_grid.copy()
+            self.sigma_mu_grid = np.zeros(n, dtype=float)
+            self.mu_lcb_grid = mu_grid.copy()
+            self.mu_is_conformal_safe = False
+            self.friction_predict_time_ms = 0.0
+            self.friction_meta = {"source": "mu_profile" if mu_profile is not None else "mu_default"}
+
+        if apply_plan_scale is None:
+            self.mu_effective_plan_scale = 1.0 if (friction_estimator is not None and self.mu_is_conformal_safe) else self.mu_plan_scale
+        else:
+            self.mu_effective_plan_scale = self.mu_plan_scale if bool(apply_plan_scale) else 1.0
         self.mu_grid = mu_grid
 
         self._compute_corridor_modulation(s_grid, d_net_profile)
@@ -1619,6 +1766,11 @@ class CoupledVelocityTubeH124:
             "plan_time_analytical_ms": round(self.plan_time_analytical_ms, 2),
             "plan_time_total_ms": round(self.plan_time_total_ms, 2),
             "conformal_lookup_time_ms": round(self.conformal_lookup_time_ms, 4),
+            "friction_predict_time_ms": round(self.friction_predict_time_ms, 4),
+            "mu_is_conformal_safe": bool(self.mu_is_conformal_safe),
+            "mu_effective_plan_scale": round(float(self.mu_effective_plan_scale), 4),
+            "mu_tube_min": round(float(np.min(mu_grid)), 4),
+            "mu_tube_max": round(float(np.max(mu_grid)), 4),
             "enable_grip": self.enable_grip,
             "enable_traction": self.enable_traction,
             "min_v_ref_geom_minus_v_ub": round(float(np.min(self.v_ref_geom_grid - v_ub)), 6),
@@ -1717,6 +1869,18 @@ class CoupledVelocityTubeH124:
             })
         return {"levels": comparison}
 
+    def get_horizon_mu_plan(self, s_horizon: np.ndarray) -> np.ndarray:
+        """
+        Nội suy hệ số ma sát hoạch định hiệu dụng mu_plan(s) = mu_effective_plan_scale * mu_grid(s)
+        dọc theo chân trời dự báo s_horizon (tránh phạt kép khi đã dùng Conformal LCB).
+        """
+        if not self.is_ready or self.s_grid is None or self.mu_grid is None:
+            s_arr = np.asarray(s_horizon, dtype=float)
+            return np.full_like(s_arr, max(0.05, self.mu_plan_scale * self.mu_default), dtype=float)
+        s_q = np.clip(np.asarray(s_horizon, dtype=float), 0.0, self.s_grid[-1])
+        mu_interp = np.interp(s_q, self.s_grid, self.mu_grid)
+        return np.maximum(0.05, self.mu_effective_plan_scale * mu_interp)
+
     def query_online_horizon_tube(
         self,
         s_horizon: np.ndarray,
@@ -1729,8 +1893,8 @@ class CoupledVelocityTubeH124:
         """
         Cập nhật Trực tuyến ở tần số 20 Hz (khi xe đang chạy t > 0 và có trạng thái từ EKF):
         - Trọng số suy giảm pha trong miền thời gian gamma_phase(Delta_t) = exp(-Delta_t / tau_phase).
-        - Hệ số tỷ lệ ma sát trực tuyến sqrt(mu_hat / mu_default) CHỈ áp dụng riêng cho nhánh
-          trần bám đường v_grip_online(s_n), không làm méo trần sóng sánh hay độ giật.
+        - Hệ số tỷ lệ ma sát trực tuyến sqrt(mu_online / mu_plan(s_q)) theo đúng ma sát hoạch định cục bộ
+          CHỈ áp dụng riêng cho nhánh trần bám đường v_grip_online(s_n), không làm méo trần sóng sánh hay độ giật.
         - Sàn vận tốc thoát giao lộ v_escape_safe luôn bị chặn trên bởi trần cơ học v_phys_online(s_n).
         """
         if not self.is_ready:
@@ -1769,10 +1933,13 @@ class CoupledVelocityTubeH124:
         v_slosh_online = np.minimum(self.v_max, np.sqrt((g * theta_eq_max_online) / (np.abs(kappa_q) + 1e-6)))
 
         if self.enable_grip:
-            grip_scale = 1.0
             if mu_online is not None:
-                grip_scale = float(np.sqrt(max(0.08, mu_online) / self.mu_default))
-            v_grip_online = np.minimum(self.v_max, v_grip_nom_q * grip_scale)
+                mu_plan_q = self.get_horizon_mu_plan(s_q)
+                mu_on_arr = np.maximum(0.05, np.asarray(mu_online, dtype=float))
+                grip_scale = np.sqrt(mu_on_arr / mu_plan_q)
+                v_grip_online = np.minimum(self.v_max, v_grip_nom_q * grip_scale)
+            else:
+                v_grip_online = v_grip_nom_q.copy()
         else:
             v_grip_online = np.full_like(v_slosh_online, self.v_max)
 

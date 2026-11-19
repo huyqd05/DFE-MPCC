@@ -227,7 +227,7 @@ class DFEMPCCAMRController:
         P_phi_est = opti.parameter(4)
         # [ox, oy, oz, r_obs, d_safe, vox, voy]; vox = voy = 0 -> vật cản tĩnh (giống bản cũ)
         P_obs = opti.parameter(7)
-        P_mu = opti.parameter(1)              # Hệ số ma sát sàn trực tuyến
+        P_mu = opti.parameter(1, self.N)       # Hệ số ma sát hoạch định dọc chân trời dự báo
         P_q_eta = opti.parameter(1)           # Nguồn lượng tử Conformal an toàn q_eta (m) cho ràng buộc T2
         P_dfz_iso = opti.parameter(4)         # Biến thiên tải pháp tuyến 4 bánh do mặt đường ISO 8608 (N)
         P_v_ub = opti.parameter(1, self.N)    # Trần Ống vận tốc khả thi bậc 3 (m/s) dọc chân trời dự báo
@@ -339,10 +339,10 @@ class DFEMPCCAMRController:
                 # 3.3 Vector Wrench yêu cầu trên thân xe: W_cmd = [F_bx, F_by, Tau_bz]^T
                 W_cmd = cs.vertcat(F_cmd_bx, F_cmd_by, Tau_cmd_bz)
 
-                # 3.4 Giới hạn bám ma sát 4 bánh xe Mecanum với biên hoạch định P3 (mu_plan_scale = 0.95):
-                # ||F_ground,i|| = sqrt(2)*|f_i| <= (mu_plan_scale * mu) * Fz_i
+                # 3.4 Giới hạn bám ma sát 4 bánh xe Mecanum với biên hoạch định dọc chân trời P_mu[0, k]:
+                # ||F_ground,i|| = sqrt(2)*|f_i| <= mu_plan_k * Fz_i
                 inv_sqrt2 = 1.0 / np.sqrt(2.0)
-                mu_plan = self.mu_plan_scale * P_mu
+                mu_plan = P_mu[0, k]
                 f_bar_1 = (mu_plan * Fz_1) * inv_sqrt2
                 f_bar_2 = (mu_plan * Fz_2) * inv_sqrt2
                 f_bar_3 = (mu_plan * Fz_3) * inv_sqrt2
@@ -462,7 +462,7 @@ class DFEMPCCAMRController:
         self.P_v_ub = P_v_ub
         self.P_v_lb = P_v_lb
 
-    def solve_step(self, x_current, phi_est, obs_info=None, mu_floor=None, q_eta=None, dfz_iso=None, v_ub_horizon=None, v_lb_horizon=None):
+    def solve_step(self, x_current, phi_est, obs_info=None, mu_floor=None, q_eta=None, dfz_iso=None, v_ub_horizon=None, v_lb_horizon=None, mu_horizon=None):
         """
         Thực thi giải một chu kỳ DFE-MPCC (20 Hz) nhúng Ống vận tốc khả thi bậc 3 (H124)
         và biên mặt đường ngẫu nhiên ISO 8608.
@@ -473,8 +473,6 @@ class DFEMPCCAMRController:
         obs_info = np.asarray(obs_info, dtype=float).ravel()
         if obs_info.size < 7:
             obs_info = np.concatenate([obs_info, np.zeros(7 - obs_info.size)])
-        if mu_floor is None:
-            mu_floor = self.default_mu
         q_eta_apply = float(q_eta if q_eta is not None else self.default_q_eta_m)
         if dfz_iso is None:
             dfz_iso_vec = np.zeros(4)
@@ -504,6 +502,19 @@ class DFEMPCCAMRController:
             th_path[0, k] = prev_h
             
         # 2. Nạp tham số vào bộ giải
+        if mu_horizon is not None:
+            mu_plan_vec = np.asarray(mu_horizon, dtype=float).reshape(1, self.N)
+        elif mu_floor is not None:
+            if np.ndim(mu_floor) > 0:
+                mu_plan_vec = np.asarray(mu_floor, dtype=float).reshape(1, self.N) * self.mu_plan_scale
+            else:
+                mu_plan_vec = np.full((1, self.N), float(mu_floor) * self.mu_plan_scale)
+        elif self.tube_planner is not None and getattr(self.tube_planner, "is_ready", False) and getattr(self.tube_planner, "mu_grid", None) is not None:
+            mu_plan_vec = self.tube_planner.get_horizon_mu_plan(path_sbar[0, :]).reshape(1, self.N)
+        else:
+            mu_plan_vec = np.full((1, self.N), float(self.default_mu) * self.mu_plan_scale)
+        mu_plan_vec = np.maximum(0.05, mu_plan_vec)
+
         self.opti.set_value(self.P_x0, x_current)
         self.opti.set_value(self.P_path_p, path_p)
         self.opti.set_value(self.P_path_t, path_t)
@@ -511,7 +522,7 @@ class DFEMPCCAMRController:
         self.opti.set_value(self.P_th_path, th_path)
         self.opti.set_value(self.P_phi_est, phi_est)
         self.opti.set_value(self.P_obs, obs_info)
-        self.opti.set_value(self.P_mu, float(mu_floor))
+        self.opti.set_value(self.P_mu, mu_plan_vec)
         self.opti.set_value(self.P_q_eta, q_eta_apply)
         self.opti.set_value(self.P_dfz_iso, dfz_iso_vec)
         
@@ -578,6 +589,7 @@ class DFEMPCCAMRController:
             'status': status,
             'slack_tube': slack_tube_val,
             'v_ub_preview': v_ub_vec.flatten(),
+            'mu_plan_preview': mu_plan_vec.flatten(),
             'slack_zono_max': slack_zono_val
         }
         
