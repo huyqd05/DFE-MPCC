@@ -713,8 +713,16 @@ def build_map_scenario(map_name: str):
 
     waypoints = []
     used_r = 0.24
-    xy_lim = 3.1 if base_name == "world8.xml" else 2.9
-    for r_test in [0.24, 0.22, 0.20, 0.18]:
+    if base_name == "world9.xml":
+        xy_lim = 3.50
+        r_candidates = [0.30, 0.28, 0.24, 0.22]
+    elif base_name == "world8.xml":
+        xy_lim = 3.1
+        r_candidates = [0.24, 0.22, 0.20, 0.18]
+    else:
+        xy_lim = 2.9
+        r_candidates = [0.24, 0.22, 0.20, 0.18]
+    for r_test in r_candidates:
         planner = AStarPlanner(x_bounds=(-xy_lim, xy_lim), y_bounds=(-xy_lim, xy_lim), resolution=0.05, robot_radius=r_test)
         planner.add_obstacles(obs_circles_raw, obs_boxes_raw)
         waypoints = planner.plan(start_pos=start_pos[:2], goal_pos=goal_pos[:2], smooth=True)
@@ -728,7 +736,22 @@ def build_map_scenario(map_name: str):
         path_s[i] = path_s[i - 1] + np.linalg.norm(wp_arr[i] - wp_arr[i - 1])
 
     checkpoints_6 = []
-    if base_name == "world8.xml":
+    if base_name == "world9.xml":
+        checkpoints_6 = [
+            {"name": "CP1", "desc": "Chicane Kệ Tây-Bắc", "s_m": 2.10, "pos": [-2.10, 0.85], "R_mm": 0.0},
+            {"name": "CP2", "desc": "Cua 180° Nhập liệu Nam", "s_m": 4.98, "pos": [-1.70, -1.70], "R_mm": 0.0},
+            {"name": "CP3", "desc": "Chicane Trạm CNC Giữa", "s_m": 7.24, "pos": [-0.55, 0.00], "R_mm": 0.0},
+            {"name": "CP4", "desc": "Cua 180° Đỉnh Bắc", "s_m": 9.85, "pos": [-0.10, 2.05], "R_mm": 0.0},
+            {"name": "CP5", "desc": "Khu Rửa & Cua 180° Nam-Đông", "s_m": 14.20, "pos": [1.70, -1.75], "R_mm": 0.0},
+            {"name": "CP6", "desc": "Cửa Z Xuất Hàng Đông", "s_m": 17.44, "pos": [2.25, 1.20], "R_mm": 0.0},
+        ]
+        inj_configs = [
+            {"type": "dynamic_cylinder", "center_override": [-2.55, -0.30], "radius": 0.14, "amp": 0.52, "omega": 1.00, "phase": 1.10, "slide_axis": "1 0 0", "rgba": "0.95 0.15 0.60 1", "name": "dyn_obs_1_west"},
+            {"type": "dynamic_cylinder", "center_override": [-1.05, 0.80], "radius": 0.14, "amp": 0.48, "omega": 0.95, "phase": 0.35, "slide_axis": "1 0 0", "rgba": "0.05 0.72 0.85 1", "name": "dyn_obs_2_center"},
+            {"type": "dynamic_cylinder", "center_override": [2.55, -0.50], "radius": 0.14, "amp": 0.55, "omega": 0.92, "phase": 1.75, "slide_axis": "1 0 0", "rgba": "0.98 0.55 0.05 1", "name": "dyn_obs_3_east"},
+        ]
+        model, dyn_configs, _ = create_injected_simulation_model(f"xml/{base_name}", wp_arr, configs=inj_configs)
+    elif base_name == "world8.xml":
         checkpoints_6 = [
             {"name": "CP1", "desc": "Cua 180° Tây (s=3.8m)", "s_m": 3.78, "pos": [-2.35, 2.05], "R_mm": 2.15},
             {"name": "CP2", "desc": "Điểm Uốn Chicane Giữa-Tây", "s_m": 5.40, "pos": [-0.65, -0.80], "R_mm": 1.85},
@@ -1210,8 +1233,8 @@ def run_ros2_rviz_headless_simulation(
         state_con_mode="skip0",
         mu_plan_scale=0.95,
         ipopt_max_iter=30,
-        x_bounds=(-3.25, 3.25) if base_name == "world8.xml" else (-3.0, 3.0),
-        y_bounds=(-3.25, 3.25) if base_name == "world8.xml" else (-3.0, 3.0)
+        x_bounds=(-3.55, 3.55) if base_name == "world9.xml" else ((-3.25, 3.25) if base_name == "world8.xml" else (-3.0, 3.0)),
+        y_bounds=(-3.55, 3.55) if base_name == "world9.xml" else ((-3.25, 3.25) if base_name == "world8.xml" else (-3.0, 3.0)),
     )
     controller.set_path(wp_arr)
 

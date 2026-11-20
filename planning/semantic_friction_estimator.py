@@ -217,6 +217,15 @@ def make_world_semantic_map(map_name: str) -> SemanticFloorMap:
             {"shape": "rect", "cx": -0.55, "cy": -0.55, "hx": 0.80, "hy": 0.90, "angle": 0.0, "label": "epoxy", "blend_m": 0.09},
             {"shape": "circle", "cx": 1.75, "cy": 1.45, "r": 0.68, "label": "wet_risk", "blend_m": 0.09},
         ]
+    elif b in ("world9.xml", "world9", "map9.xml", "map9"):
+        # Sàn xưởng công nghiệp chuẩn: nền bê tông khô (mặc định) + khu gia công Epoxy
+        # + khu rửa chi tiết / dung dịch tưới nguội (wet_risk) + góc chuyển tiếp chưa khảo sát (unknown)
+        zones = [
+            {"shape": "rect", "cx": -0.85, "cy": 0.20, "hx": 0.85, "hy": 1.35, "angle": 0.0, "label": "epoxy", "blend_m": 0.09},
+            {"shape": "rect", "cx": 0.85, "cy": 0.15, "hx": 0.78, "hy": 1.05, "angle": 0.0, "label": "wet_risk", "blend_m": 0.09},
+            {"shape": "rect", "cx": 2.65, "cy": 0.55, "hx": 0.85, "hy": 1.05, "angle": 0.0, "label": "epoxy", "blend_m": 0.09},
+            {"shape": "circle", "cx": -2.10, "cy": -0.35, "r": 0.45, "label": "unknown", "blend_m": 0.09},
+        ]
     else:
         zones = [
             {"shape": "rect", "cx": 0.0, "cy": 0.0, "hx": 0.90, "hy": 0.90, "angle": 0.0, "label": "epoxy", "blend_m": 0.09},

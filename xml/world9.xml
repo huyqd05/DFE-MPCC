@@ -1,0 +1,64 @@
+<mujoco model="industrial_factory_floor_map9">
+    <!-- ============================================================================= -->
+    <!-- WORLD9.XML: BẢN ĐỒ NHÀ XƯỞNG CÔNG NGHIỆP MỚI HOÀN TOÀN (MAP 9 - 7.2 x 7.2 M)  -->
+    <!-- Không có dữ liệu chạy trước (Zero-Shot).                                      -->
+    <!-- Bố cục: 4 hành lang công nghiệp + trạm CNC + trụ kết cấu + cửa Z xuất hàng   -->
+    <!-- Start (-2.75, +2.75) [Tây-Bắc] -> Goal (+2.75, +2.75) [Đông-Bắc]              -->
+    <!-- ============================================================================= -->
+    <compiler angle="radian"/>
+    <option gravity="0 0 -9.81" timestep="0.005"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker" rgb1=".18 .21 .26" rgb2=".11 .14 .18" width="320" height="320"/>
+        <material name="gridmat" texture="grid" texrepeat="24 24" reflectance="0.2"/>
+    </asset>
+
+    <default>
+        <default class="wall">
+            <geom type="box" group="1" rgba="0.46 0.52 0.60 1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="dyn_obs">
+            <geom group="1" friction="0.8 0.005 0.0001"/>
+        </default>
+        <default class="marker">
+            <site type="cylinder" size="0.25 0.005" group="2"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <light pos="0 0 6" dir="0 0 -1" diffuse="1 1 1"/>
+
+        <!-- Sàn nhà xưởng 9.0 x 9.0 m -->
+        <geom name="ground" type="plane" size="4.5 4.5 0.1" material="gridmat"/>
+
+        <!-- ĐIỂM XUẤT PHÁT (Tây-Bắc) VÀ ĐÍCH ĐẾN (Đông-Bắc) -->
+        <geom name="start_marker" group="2" type="cylinder" size="0.25 0.004" pos="-2.75 2.75 0.004" rgba="0.2 0.5 1.0 0.8" contype="0" conaffinity="0"/>
+        <geom name="goal_marker"  group="2" type="cylinder" size="0.25 0.004" pos="2.75 2.75 0.004"  rgba="0.1 0.9 0.25 0.8" contype="0" conaffinity="0"/>
+
+        <!-- 1. TƯỜNG BAO NHÀ XƯỞNG (7.2 x 7.2 M) -->
+        <geom class="wall" name="wall_n" size="3.65 0.05 0.5" pos="0 3.60 0.5"/>
+        <geom class="wall" name="wall_s" size="3.65 0.05 0.5" pos="0 -3.60 0.5"/>
+        <geom class="wall" name="wall_e" size="0.05 3.65 0.5" pos="3.60 0 0.5"/>
+        <geom class="wall" name="wall_w" size="0.05 3.65 0.5" pos="-3.60 0 0.5"/>
+
+        <!-- 2. VÁCH NGĂN PHÂN XƯỞNG (TẠO 4 HÀNH LANG & 3 CUA 180 ĐỘ) -->
+        <!-- Vách 1: từ tường Bắc xuống y = -1.45 tại x = -1.75 -->
+        <geom class="wall" name="wall_1" size="0.05 2.525 0.5" pos="-1.75 1.075 0.5"/>
+        <!-- Vách 2: từ tường Nam lên y = +1.45 tại x = -0.05 -->
+        <geom class="wall" name="wall_2" size="0.05 2.525 0.5" pos="-0.05 -1.075 0.5"/>
+        <!-- Vách 3: từ tường Bắc xuống y = -1.45 tại x = +1.70 -->
+        <geom class="wall" name="wall_3" size="0.05 2.525 0.5" pos="1.70 1.075 0.5"/>
+
+        <!-- 3. BỆ MÁY CNC, KỆ KHO & TRỤ KẾT CẤU CÔNG NGHIỆP (TẠO CHICANE) -->
+        <geom class="wall" name="rack_nw" size="0.45 0.14 0.5" pos="-3.10 0.75 0.5" rgba="0.35 0.45 0.55 1"/>
+        <geom class="obs"  name="pillar_sw" type="cylinder" size="0.18 0.5" pos="-2.85 -1.10 0.5" rgba="0.65 0.45 0.25 1"/>
+        <geom class="wall" name="cnc_mid_w" size="0.45 0.16 0.5" pos="-1.25 0.10 0.5" rgba="0.35 0.45 0.55 1"/>
+        <geom class="obs"  name="pillar_mid_n" type="cylinder" size="0.16 0.5" pos="-0.55 1.35 0.5" rgba="0.65 0.45 0.25 1"/>
+        <geom class="obs"  name="wash_pillar_ce" type="cylinder" size="0.18 0.5" pos="1.10 -0.25 0.5" rgba="0.65 0.45 0.25 1"/>
+        <geom class="wall" name="rack_se" size="0.45 0.14 0.5" pos="3.10 0.65 0.5" rgba="0.35 0.45 0.55 1"/>
+        <geom class="obs"  name="pillar_ne" type="cylinder" size="0.16 0.5" pos="2.20 1.75 0.5" rgba="0.65 0.45 0.25 1"/>
+    </worldbody>
+</mujoco>
