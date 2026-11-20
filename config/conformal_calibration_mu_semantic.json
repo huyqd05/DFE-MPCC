@@ -1,0 +1,55 @@
+{
+  "version": "1.0_zeroshot_semantic",
+  "class_params": {
+    "dry_concrete": {
+      "mu_0": 0.35,
+      "sigma_0": 0.035
+    },
+    "epoxy": {
+      "mu_0": 0.26,
+      "sigma_0": 0.03
+    },
+    "wet_risk": {
+      "mu_0": 0.14,
+      "sigma_0": 0.025
+    },
+    "unknown": {
+      "mu_0": 0.22,
+      "sigma_0": 0.045
+    }
+  },
+  "hyperparams": {
+    "mu_min": 0.08,
+    "mu_max": 0.55,
+    "query_mode": "footprint",
+    "L_x": 0.12,
+    "L_y": 0.14,
+    "lateral_margin": 0.05
+  },
+  "q_hat_mu": 3.6849565958452692,
+  "alpha_mu": 0.05,
+  "calibration_summary": {
+    "method": "Zero-Shot Multi-Map Class Split Conformal",
+    "query_mode": "footprint",
+    "n_cal": 80,
+    "alpha_mu": 0.05,
+    "target_coverage": 0.95,
+    "k_star": 77,
+    "q_hat_mu": 3.684957,
+    "score_mean": 2.490307,
+    "score_median": 2.451644,
+    "score_max": 3.969895,
+    "lag1_autocorr": -0.0032,
+    "lag1_z_stat": 0.0282,
+    "lag1_no_serial_dep_detected": true,
+    "exchangeability_ok": true,
+    "bonferroni_joint_budget": {
+      "alpha_eta": 0.05,
+      "alpha_fz": 0.025,
+      "alpha_mu_025": 0.025,
+      "alpha_total_with_025": 0.1,
+      "q_hat_mu_at_alpha_025": 3.685651,
+      "k_star_at_alpha_025": 79
+    }
+  }
+}

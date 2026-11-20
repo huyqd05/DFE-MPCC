@@ -62,7 +62,19 @@ from test_sim_amr_closed_loop import (
     OccupancyGrid,
 )
 from benchmark_world6_complex_4dyn_obs import compute_world6_slosh_elevation_mm
-from mecanum_traction_dynamics import compute_dynamic_normal_loads
+from mecanum_traction_dynamics import (
+    M_TOTAL, M_1X, M_1Y, L_P_X, L_P_Y,
+    compute_dynamic_normal_loads,
+    allocate_wheel_forces_clamped,
+    evaluate_traction_and_slip,
+)
+from robot_model_amr_casadi import IZ_BASE, omega_x, omega_y
+from friction_observer_ffrls import FrictionObserverFFRLS, OnlineFrictionFusion
+from semantic_friction_estimator import (
+    SemanticFrictionEstimator,
+    make_world_semantic_map,
+    make_hidden_oil_macro_fn,
+)
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -1115,6 +1127,8 @@ def run_ros2_rviz_headless_simulation(
     existing_rclpy: bool = False,
     existing_rviz_proc=None,
     existing_pj_proc=None,
+    enable_hidden_oil: bool = True,
+    use_ros: bool = True,
 ):
     scen = build_map_scenario(map_name)
     base_name = scen["map_name"]
@@ -1139,24 +1153,27 @@ def run_ros2_rviz_headless_simulation(
 
     data = mujoco.MjData(model)
 
-    if not existing_rclpy:
+    ros_active = bool(HAS_RCLPY and use_ros and rclpy is not None)
+    if ros_active and not existing_rclpy:
         rclpy.init()
 
-    ros_node = SimpatRos2RvizHeadlessNode(
-        map_name=base_name,
-        model=model,
-        waypoints=wp_arr,
-        obs_boxes=obs_boxes,
-        obs_circles=obs_circles,
-        map_geoms=map_geoms,
-        checkpoints_6=checkpoints_6,
-        start_pos=start_pos,
-        goal_pos=goal_pos
-    )
-    ros_node.clear_old_markers()
+    ros_node = None
+    if ros_active:
+        ros_node = SimpatRos2RvizHeadlessNode(
+            map_name=base_name,
+            model=model,
+            waypoints=wp_arr,
+            obs_boxes=obs_boxes,
+            obs_circles=obs_circles,
+            map_geoms=map_geoms,
+            checkpoints_6=checkpoints_6,
+            start_pos=start_pos,
+            goal_pos=goal_pos
+        )
+        ros_node.clear_old_markers()
 
     rviz_proc = existing_rviz_proc
-    if launch_rviz and rviz_proc is None:
+    if ros_active and launch_rviz and rviz_proc is None:
         rviz_cfg_path = os.path.join(PROJECT_DIR, "config", "simpat_rviz2.rviz")
         print(f">>> Đang khởi chạy giao diện đồ họa ROS 2 RViz2 ({rviz_cfg_path})...")
         env = os.environ.copy()
@@ -1198,28 +1215,39 @@ def run_ros2_rviz_headless_simulation(
     )
     controller.set_path(wp_arr)
 
-    # GIAI ĐOẠN A (t = 0): Quy hoạch Ống vận tốc khả thi bậc 3 Krasnoselskii-Mann và tích hợp vào NLP
+    # GIAI ĐOẠN A (t = 0): Quy hoạch Ống vận tốc Zero-Shot Semantic Prior + Split Conformal LCB (Tầng 1 - Hướng đi 1)
+    sem_map = make_world_semantic_map(base_name)
+    semantic_estimator = SemanticFrictionEstimator.from_calibration_or_default(semantic_map=sem_map)
+
+    # Đặt vũng dầu ẩn (ngoài bản đồ ngữ nghĩa) CHỈ ở phía Plant (Vật lý thực tế) để kiểm tra Tầng 2
+    hidden_oil_patches = []
+    if enable_hidden_oil:
+        wp_labels = sem_map.eval_classes_batch(wp_arr)
+        i_mid = len(wp_arr) // 2
+        dry_mid = [
+            i for i in range(max(0, int(0.35 * len(wp_arr))), min(len(wp_arr), int(0.65 * len(wp_arr))))
+            if wp_labels[i] == "dry_concrete"
+        ]
+        oil_idx = dry_mid[len(dry_mid) // 2] if dry_mid else i_mid
+        hidden_oil_patches.append({
+            "shape": "circle",
+            "cx": float(wp_arr[oil_idx, 0]),
+            "cy": float(wp_arr[oil_idx, 1]),
+            "r": 0.45,
+            "mu": 0.13,
+            "blend_m": 0.05,
+        })
+    plant_macro_fn = make_hidden_oil_macro_fn(sem_map.macro_friction_fn, hidden_oil_patches)
+
     tube_planner = None
     try:
         from velocity_tube_h124 import CoupledVelocityTubeH124
-        from iso8608_road_profile import get_world7_zone_friction, get_world8_zone_friction
-        mu_zone_fn = get_world8_zone_friction if base_name == "world8.xml" else get_world7_zone_friction
-        print(f"\n>>> [GIAI ĐOẠN A - t=0]: QUY HOẠCH ỐNG VẬN TỐC KHẢ THI BẬC 3 (KRASNOSELSKII-MANN, BETA=0.65)...")
+        print(f"\n>>> [GIAI ĐOẠN A - t=0]: QUY HOẠCH ỐNG VẬN TỐC ZERO-SHOT SEMANTIC CONFORMAL LCB (KRASNOSELSKII-MANN)...")
 
         n_wps = len(wp_arr)
-        mu_wps = np.zeros(n_wps)
         camber_wps = np.zeros(n_wps)
-        zc_wps = np.zeros(n_wps)
+        zc_wps = np.full(n_wps, 0.0555)
         d_net_wps = np.full(n_wps, 0.42)
-
-        for i_wp, (wx, wy) in enumerate(wp_arr):
-            mu_val = mu_zone_fn(wx, wy)
-            mu_wps[i_wp] = mu_val
-            camber_wps[i_wp] = 0.0
-            zc_wps[i_wp] = 0.0555
-
-        def mu_profile_fn(s_val):
-            return float(np.interp(s_val, path_s, mu_wps))
 
         def camber_profile_fn(s_val):
             return float(np.interp(s_val, path_s, camber_wps))
@@ -1233,16 +1261,18 @@ def run_ros2_rviz_headless_simulation(
         tube_planner = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
         tube_summary = tube_planner.build_offline_tube(
             wp_arr,
-            mu_profile=mu_profile_fn,
+            friction_estimator=semantic_estimator,
+            friction_mode="conformal_lcb",
             phi_camber_profile=camber_profile_fn,
             z_com_profile=zc_profile_fn,
             d_net_profile=dnet_profile_fn,
             run_wcsph_check=False
         )
         controller.set_tube_planner(tube_planner)
+        controller.mu_plan_scale = float(getattr(tube_planner, "mu_effective_plan_scale", 1.0))
         print(f"  [✓] Ống vận tốc đã hội tụ sau {tube_summary['n_fp_iters']} vòng lặp! ||T(v)-v||_inf = {tube_summary['fp_unrelaxed_residual']:.6f} m/s")
         print(f"  [✓] Chiều dài quỹ đạo L: {tube_summary['path_length_m']:.2f} m ({tube_summary['n_grid']} điểm lưới, ds = {tube_summary['ds_m']:.3f} m)")
-        print(f"  [✓] Trần vận tốc khả thi: v_ub in [{tube_planner.v_ub_nom.min():.2f}, {tube_planner.v_ub_nom.max():.2f}] m/s")
+        print(f"  [✓] Trần vận tốc khả thi: v_ub in [{tube_planner.v_ub_nom.min():.2f}, {tube_planner.v_ub_nom.max():.2f}] m/s | q_hat_mu = {semantic_estimator.q_hat_mu:.3f}")
         print(f"  [✓] Đã kích hoạt 4 nút thắt vật lý độc lập (v_slosh, v_jerk, v_grip, v_traction) tích hợp vào NMPC!")
     except Exception as e:
         print(f"  [!] Cảnh báo không thể nạp CoupledVelocityTubeH124: {e}")
@@ -1260,7 +1290,26 @@ def run_ros2_rviz_headless_simulation(
     mujoco.mj_forward(model, data)
 
     nmpc_dt = 0.05
-    mu_base = 0.20
+    mu_plan_init = (
+        float(np.asarray(tube_planner.get_horizon_mu_plan([0.0])).ravel()[0])
+        if (tube_planner is not None and getattr(tube_planner, "is_ready", False))
+        else 0.22
+    )
+    friction_observer = FrictionObserverFFRLS(
+        mu_init=mu_plan_init,
+        lam=None,
+        adaptive_forgetting=True,
+        rho_deadzone=0.06,
+    )
+    friction_fusion = OnlineFrictionFusion(mu_min=0.08, mu_max=0.55)
+    mu_rls_curr = mu_plan_init
+    bin_curr = 0
+    mu_fuse_h = np.full(controller.N, mu_plan_init, dtype=float)
+    slip_count = 0
+    max_slip_overall = 0.0
+    mu_fuse_history = []
+    slip_history = []
+
     q_eta_use = float(_CAL_BUDGET["recommended_q_eta_m"])
     sim_time = 0.0
     s_prog = 0.0
@@ -1288,6 +1337,7 @@ def run_ros2_rviz_headless_simulation(
     solve_times = []
     far_obs = np.array([20.0, 20.0, 0.0, 0.1, 0.1])
     dashing_gate_idx = -1
+    was_waiting = False
 
     print("-" * 102)
     print(f"{'Thời gian':>8} | {'Tiến độ s':>11} | {'Vận tốc':>8} | {'Đỉnh sóng':>10} | {'Cự ly tĩnh':>11} | {'Vật cản gần nhất':>18} | {'Trạng thái điều hướng ROS 2'}")
@@ -1312,6 +1362,7 @@ def run_ros2_rviz_headless_simulation(
 
         # Kiểm tra điều kiện Đợi/Vượt dọc cung đường A* (Predictive 1D Longitudinal Gate-Timing)
         v_fb = min(0.48, max(0.28, locals().get("v_ref_cmd", 0.35)))
+        accel_dash_eval = min(0.60, max(0.35, 0.55 * float(mu_fuse_h[0]) * 9.81))
         should_wait, active_gate, dashing_gate_idx, is_tight_gate = evaluate_gate_crossing(
             gate_descriptors=gate_descriptors,
             s_prog=s_prog,
@@ -1324,32 +1375,26 @@ def run_ros2_rviz_headless_simulation(
             v_dash_fallback=v_fb,
             v_dash_bounds=(0.28, 0.48),
             delta_s_hi=0.52,
-            base_clear_thresh=0.05,
-            accel_dash=0.60,
-            tau_extra=1.2,
+            base_clear_thresh=0.10,
+            accel_dash=accel_dash_eval,
+            tau_extra=1.35,
             tau_floor=4.0,
             n_samples=55,
             s_win_back=0.40,
             s_win_ahead=0.55,
             s_end_margin=0.65,
         )
+        was_waiting = bool(should_wait)
 
         road_eval = road_profile.compute_wheel_loads_and_slosh_excitation(
-            q_meas, v_meas, mu_nominal=mu_zone_fn
+            q_meas, v_meas, mu_nominal=plant_macro_fn
         )
         dfz_iso_now = road_eval["dfz_iso_wheels"]
         a_road_body = road_eval["a_road_body"]
-        mu_local = road_eval.get("mu_local", mu_base)
-        mu_min_w = road_eval.get("mu_min_wheel", mu_local)
-
-        if tube_planner is not None and getattr(tube_planner, "is_ready", False):
-            v_ub_exact = float(np.interp(s_prog, tube_planner.s_grid, tube_planner.v_ub_nom))
-            v_ref_cmd = float(np.clip(v_ub_exact, 0.18, 0.68))
-        else:
-            v_ref_cmd = 0.45 if dashing_gate_idx >= 0 else 0.25
-
-        if dashing_gate_idx >= 0:
-            v_ref_cmd = max(v_ref_cmd, 0.36)
+        mu_wheels_true = np.asarray(
+            road_eval.get("mu_wheels", [plant_macro_fn(q_meas[0], q_meas[1])] * 4),
+            dtype=float,
+        )
 
         x_curr = np.zeros(12)
         x_curr[0:3] = q_meas
@@ -1366,10 +1411,38 @@ def run_ros2_rviz_headless_simulation(
             dphi_y_meas
         ])
 
+        vs_prev_tube = max(float(np.clip(x_curr[10], 0.05, 0.75)), 0.40)
+        s_vec_mpc = np.clip(
+            s_prog + np.arange(controller.N, dtype=float) * controller.dt * vs_prev_tube,
+            0.0,
+            controller.path_length,
+        )
+        s_tube_h = controller.map_s_mpc_to_tube(s_vec_mpc)
+        if tube_planner is not None and getattr(tube_planner, "is_ready", False):
+            mu_plan_h = tube_planner.get_horizon_mu_plan(s_tube_h)
+            mu_fuse_h = friction_fusion.fuse_horizon_mu(
+                mu_plan_h, s_tube_h, mu_rls_curr, bin_curr, s_curr=float(s_tube_h[0])
+            )
+            v_ub_h, v_lb_h = tube_planner.query_online_horizon_tube(
+                s_tube_h, phi_est, mu_online=mu_fuse_h
+            )
+            v_ub_h = np.maximum(0.08, v_ub_h)
+            v_lb_h = np.minimum(v_lb_h, v_ub_h)
+            v_ref_cmd = float(np.clip(v_ub_h[0], 0.12, 0.68))
+        else:
+            mu_fuse_h = np.full(controller.N, 0.22, dtype=float)
+            v_ub_h = np.full(controller.N, 0.45 if dashing_gate_idx >= 0 else 0.25, dtype=float)
+            v_lb_h = np.zeros(controller.N, dtype=float)
+            v_ref_cmd = float(v_ub_h[0])
+
+        if dashing_gate_idx >= 0:
+            v_ref_cmd = max(v_ref_cmd, min(0.36, 0.42 * float(np.sqrt(max(0.08, mu_fuse_h[0]) / 0.22))))
+
         t_sol0 = time.perf_counter()
         if should_wait:
             data.qvel[:3] = 0.0
             a_act[:] = 0.0
+            a_bx0, a_by0 = 0.0, 0.0
             vs_prog = 0.0
             as_prog = 0.0
             if active_gate >= 0:
@@ -1377,38 +1450,109 @@ def run_ros2_rviz_headless_simulation(
             x_pred = np.tile(x_curr.reshape(-1, 1), (1, controller.N + 1))
             jerk_val = 0.0
             sol_ms = 0.5
+            W_cmd_body = np.zeros(3, dtype=float)
+            f_chassis_act_body = np.zeros(3, dtype=float)
+            wheel_slips = np.zeros(4, dtype=float)
+            Fz_true = np.maximum(0.889, (M_TOTAL * 9.81 / 4.0) + dfz_iso_now)
         else:
             obs_for_ctrl = select_tight_gate_obstacle(dyn_geoms, data, q_meas, far_obs) if is_tight_gate else far_obs
             u_opt, js_opt, x_pred, u_pred, info = controller.solve_step(
                 x_curr, phi_est, obs_for_ctrl,
-                mu_floor=mu_min_w,
                 q_eta=q_eta_use,
-                dfz_iso=dfz_iso_now
+                dfz_iso=dfz_iso_now,
+                v_ub_horizon=v_ub_h,
+                v_lb_horizon=v_lb_h,
+                mu_horizon=mu_fuse_h,
             )
             sol_ms = (time.perf_counter() - t_sol0) * 1000.0
             s_prog = float(x_pred[9, 1])
             vs_prog = float(x_pred[10, 1])
             as_prog = float(x_pred[11, 1])
-            a_act = np.array(x_pred[6:9, 1])
+            a_act = np.array(x_pred[6:9, 1], dtype=float)
             jerk_val = float(np.linalg.norm(u_opt[:2]))
 
             if dashing_gate_idx >= 0:
-                _, t_dir, _ = controller.get_path_reference(s_prog)
+                s_la = min(controller.path_length, s_prog + 0.25)
+                p_la, t_dir, _ = controller.get_path_reference(s_la)
+                vec_la = np.array([p_la[0] - q_meas[0], p_la[1] - q_meas[1]], dtype=float)
+                dist_la = float(np.hypot(vec_la[0], vec_la[1]))
+                dir_pull = (vec_la / dist_la) if dist_la > 0.05 else np.array([t_dir[0], t_dir[1]], dtype=float)
                 target_v = min(v_ref_cmd, 0.40)
-                data.qvel[0] = v_meas[0] + (target_v * t_dir[0] - v_meas[0]) * 0.45
-                data.qvel[1] = v_meas[1] + (target_v * t_dir[1] - v_meas[1]) * 0.45
-                data.qvel[2] = v_meas[2] + a_act[2] * nmpc_dt
-                vs_prog = float(np.hypot(data.qvel[0], data.qvel[1]))
+                dv_vec = target_v * dir_pull - v_meas[:2]
+                a_dash_xy = (dv_vec / max(nmpc_dt, 1e-3)) * 0.30
+                a_dash_cap = min(1.05, max(0.32, 0.58 * float(mu_fuse_h[0]) * 9.81))
+                nrm_dash = float(np.hypot(a_dash_xy[0], a_dash_xy[1]))
+                if nrm_dash > a_dash_cap:
+                    a_dash_xy = a_dash_xy * (a_dash_cap / nrm_dash)
+                a_cmd_world = np.array([a_dash_xy[0], a_dash_xy[1], a_act[2]], dtype=float)
+                vs_prog = float(np.hypot(v_meas[0] + a_cmd_world[0] * nmpc_dt, v_meas[1] + a_cmd_world[1] * nmpc_dt))
             else:
-                data.qvel[0] = v_meas[0] + a_act[0] * nmpc_dt
-                data.qvel[1] = v_meas[1] + a_act[1] * nmpc_dt
-                data.qvel[2] = v_meas[2] + a_act[2] * nmpc_dt
+                a_cmd_world = a_act.copy()
+
+            c_th0, s_th0 = np.cos(q_meas[2]), np.sin(q_meas[2])
+            a_bx_cmd = c_th0 * a_cmd_world[0] + s_th0 * a_cmd_world[1]
+            a_by_cmd = -s_th0 * a_cmd_world[0] + c_th0 * a_cmd_world[1]
+
+            ddphi_x_dyn = -(omega_x ** 2) * phi_x_meas + (1.0 / L_P_X) * a_bx_cmd
+            ddphi_y_dyn = -(omega_y ** 2) * phi_y_meas - (1.0 / L_P_Y) * a_by_cmd
+            F_slosh_bx_dyn = -M_1X * (-L_P_X * ddphi_x_dyn * np.cos(phi_x_meas))
+            F_slosh_by_dyn = -M_1Y * (L_P_Y * ddphi_y_dyn * np.cos(phi_y_meas))
+
+            Fz_dyn, _ = compute_dynamic_normal_loads(
+                m_total=M_TOTAL,
+                a_body=[a_bx_cmd, a_by_cmd],
+                f_slosh_body=[F_slosh_bx_dyn, F_slosh_by_dyn],
+                phi_body=[phi_x_meas, phi_y_meas],
+                z_com=0.0555,
+                z_slosh=(0.0768, 0.0768),
+                fz_min=0.889,
+            )
+            Fz_true = np.maximum(0.889, Fz_dyn + dfz_iso_now)
+            W_cmd_body = np.array([
+                M_TOTAL * a_bx_cmd - F_slosh_bx_dyn,
+                M_TOTAL * a_by_cmd - F_slosh_by_dyn,
+                IZ_BASE * a_cmd_world[2],
+            ], dtype=float)
+
+            mu_ctrl_now = float(mu_fuse_h[0])
+            f_wheels_cmd, _, _ = allocate_wheel_forces_clamped(
+                W_cmd_body,
+                f_bar=(mu_ctrl_now * Fz_true) / np.sqrt(2.0),
+                Fz=Fz_true,
+                mu=mu_ctrl_now,
+                scale_to_zonotope=False,
+            )
+            _, f_chassis_act_body, slip_metrics = evaluate_traction_and_slip(
+                f_wheels_cmd, Fz_true, mu=mu_wheels_true
+            )
+            wheel_slips = np.asarray(slip_metrics["slip_ratios"], dtype=float)
+
+            a_bx0 = (f_chassis_act_body[0] + F_slosh_bx_dyn) / M_TOTAL
+            a_by0 = (f_chassis_act_body[1] + F_slosh_by_dyn) / M_TOTAL
+            a_th0 = f_chassis_act_body[2] / IZ_BASE
+            a_wx_true = c_th0 * a_bx0 - s_th0 * a_by0
+            a_wy_true = s_th0 * a_bx0 + c_th0 * a_by0
+
+            data.qvel[0] = v_meas[0] + a_wx_true * nmpc_dt
+            data.qvel[1] = v_meas[1] + a_wy_true * nmpc_dt
+            data.qvel[2] = v_meas[2] + a_th0 * nmpc_dt
 
         solve_times.append(sol_ms)
 
-        c_th0, s_th0 = np.cos(q_meas[2]), np.sin(q_meas[2])
-        a_bx0 = c_th0 * a_act[0] + s_th0 * a_act[1]
-        a_by0 = -s_th0 * a_act[0] + c_th0 * a_act[1]
+        mu_rls_curr, _, bin_curr = friction_observer.update(
+            f_chassis_act_body[:2],
+            W_cmd_body[:2],
+            wheel_slips,
+            float(np.sum(Fz_true)),
+            M_TOTAL,
+        )
+        max_slip_step = float(np.max(wheel_slips))
+        if max_slip_step > 1e-3:
+            slip_count += 1
+        if max_slip_step > max_slip_overall:
+            max_slip_overall = max_slip_step
+        mu_fuse_history.append(float(mu_fuse_h[0]))
+        slip_history.append(max_slip_step)
 
         data.qpos[3] = np.clip(data.qpos[3] + (a_by0 / 9.81) * 0.08, -0.22, 0.22)
         data.qpos[4] = np.clip(data.qpos[4] - (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
@@ -1505,32 +1649,33 @@ def run_ros2_rviz_headless_simulation(
         fz_min_history.append(fz_min_now)
         fz_wheels_history.append(Fz_wheels.copy())
 
-        ros_node.publish_all_telemetry(
-            sim_time=sim_time,
-            q_meas=q_now,
-            v_meas=v_now_vec,
-            phi_x=float(data.qpos[3]),
-            phi_y=float(data.qpos[4]),
-            eta_mm=eta_curr,
-            x_pred=x_pred,
-            scan_ranges=meas,
-            scan_hits=hit,
-            dyn_geoms=dyn_geoms,
-            data=data,
-            nearest_dyn_name=nearest_dyn_name,
-            active_min_d=active_min_d,
-            s_prog=s_prog,
-            path_length=controller.path_length,
-            status_text=status_plain,
-            cycle=cycle,
-            fz_wheels=Fz_wheels,
-            fz_min=fz_min_now,
-            f_slosh=[F_slosh_x, F_slosh_y],
-            m_roll=M_roll,
-            v_ub=v_ref_cmd,
-            mu_local=mu_local,
-        )
-        rclpy.spin_once(ros_node, timeout_sec=0.002)
+        if ros_active and ros_node is not None:
+            ros_node.publish_all_telemetry(
+                sim_time=sim_time,
+                q_meas=q_now,
+                v_meas=v_now_vec,
+                phi_x=float(data.qpos[3]),
+                phi_y=float(data.qpos[4]),
+                eta_mm=eta_curr,
+                x_pred=x_pred,
+                scan_ranges=meas,
+                scan_hits=hit,
+                dyn_geoms=dyn_geoms,
+                data=data,
+                nearest_dyn_name=nearest_dyn_name,
+                active_min_d=active_min_d,
+                s_prog=s_prog,
+                path_length=controller.path_length,
+                status_text=status_plain,
+                cycle=cycle,
+                fz_wheels=Fz_wheels,
+                fz_min=fz_min_now,
+                f_slosh=[F_slosh_x, F_slosh_y],
+                m_roll=M_roll,
+                v_ub=v_ref_cmd,
+                mu_local=float(mu_fuse_h[0]),
+            )
+            rclpy.spin_once(ros_node, timeout_sec=0.002)
 
         if cycle % 10 == 0:
             obs_short = nearest_dyn_name.replace("dyn_obs_", "D") if nearest_dyn_name != "None" else "Clear"
@@ -1562,6 +1707,9 @@ def run_ros2_rviz_headless_simulation(
         "d_dyn_min_m": float(min_dyn_overall) if len(dyn_geoms) > 0 else float('nan'),
         "ec_max_m": float(max_contour_err),
         "t_finish_s": float(sim_time),
+        "slip_rate_pct": (100.0 * slip_count / max(1, len(slip_history))),
+        "max_slip": float(max_slip_overall),
+        "mu_fuse_min": float(min(mu_fuse_history)) if mu_fuse_history else mu_plan_init,
     }
 
     eta_status = "[THẤT BẠI: TRÀN NƯỚC]" if summary['eta_max_mm'] > 30.0 else ("[CẢNH BÁO: VƯỢT STOKES]" if summary['eta_max_mm'] > 20.0 else "[AN TOÀN]")
@@ -1599,8 +1747,9 @@ def run_ros2_rviz_headless_simulation(
     }
     plot_post_simulation_results(summary, post_hist, base_name, show_plot=launch_plot)
 
-    ros_node.destroy_node()
-    if not existing_rclpy:
+    if ros_active and ros_node is not None:
+        ros_node.destroy_node()
+    if ros_active and not existing_rclpy:
         if launch_rviz and rviz_proc is not None and rviz_proc.poll() is None:
             print("\n  [i] Giữ cửa sổ RViz2 thêm 15 giây để quan sát trạng thái về đích...")
             time.sleep(15.0)
@@ -1617,6 +1766,8 @@ if __name__ == "__main__":
     parser.add_argument("--test-all-maps", action="store_true",
                         help="Chạy kiểm chứng liên tiếp toàn bộ các bản đồ và lập bảng so sánh")
     parser.add_argument("--no-rviz", action="store_true", help="Không tự động bật cửa sổ RViz2")
+    parser.add_argument("--no-ros", action="store_true", help="Tắt node ROS 2 (chạy thuần MuJoCo headless)")
+    parser.add_argument("--no-hidden-oil", action="store_true", help="Không tiêm vũng dầu ẩn ngoài bản đồ phía Plant")
     parser.add_argument("--plot", action="store_true", default=True, help="Hiển thị cửa sổ đồ thị kết quả phân tích sau khi hoàn thành mô phỏng (mặc định: bật)")
     parser.add_argument("--no-plot", action="store_true", help="Không mở cửa sổ đồ thị sau khi chạy (chỉ lưu file ảnh PNG)")
     parser.add_argument("--time", type=float, default=54.0, help="Thời gian mô phỏng tối đa mỗi bản đồ (s)")
@@ -1624,9 +1775,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     launch_plot = not args.no_plot
+    use_ros_flag = bool(HAS_RCLPY and not args.no_ros and rclpy is not None)
 
     if args.test_all_maps:
-        rclpy.init()
+        if use_ros_flag:
+            rclpy.init()
         rviz_p = None
         pj_p = None
         all_summaries = []
@@ -1638,9 +1791,11 @@ if __name__ == "__main__":
                 launch_plot=launch_plot,
                 max_time=args.time,
                 speed_factor=args.speed,
-                existing_rclpy=True,
+                existing_rclpy=use_ros_flag,
                 existing_rviz_proc=rviz_p,
                 existing_pj_proc=pj_p,
+                enable_hidden_oil=(not args.no_hidden_oil),
+                use_ros=use_ros_flag,
             )
             all_summaries.append(s_res)
 
@@ -1661,7 +1816,8 @@ if __name__ == "__main__":
             rviz_p.terminate()
         if pj_p is not None and pj_p.poll() is None:
             pj_p.terminate()
-        rclpy.shutdown()
+        if use_ros_flag:
+            rclpy.shutdown()
     else:
         run_ros2_rviz_headless_simulation(
             map_name=args.map,
@@ -1669,4 +1825,6 @@ if __name__ == "__main__":
             launch_plot=launch_plot,
             max_time=args.time,
             speed_factor=args.speed,
+            enable_hidden_oil=(not args.no_hidden_oil),
+            use_ros=use_ros_flag,
         )

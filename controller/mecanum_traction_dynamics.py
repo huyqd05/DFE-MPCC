@@ -262,32 +262,91 @@ def evaluate_traction_and_slip(f_wheels_cmd, Fz_wheels, mu=0.35):
     return f_wheels_act, f_chassis_act, slip_metrics
 
 
+_ZONOTOPE_FACET_CACHE = {}
+
+
+def compute_zonotope_facet_matrices(L: float = L_SUM) -> tuple:
+    """
+    Tính (có bộ nhớ đệm theo L) ma trận pháp tuyến C_zono (12 x 3) và M_reach (12 x 4)
+    của Zonotope 12 mặt Z(f_bar):
+        C_zono @ W <= M_reach @ f_bar = d_zono.
+    """
+    key = round(float(L), 12)
+    cached = _ZONOTOPE_FACET_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    L_val = float(L)
+    B = np.array([
+        [ 1.0,  1.0,  1.0,  1.0],
+        [-1.0,  1.0, -1.0,  1.0],
+        [-L_val, L_val, L_val, -L_val],
+    ], dtype=float)
+    normals_6 = np.array([
+        [ 1.0,   1.0,  0.0],
+        [-1.0,   1.0,  0.0],
+        [ L_val, 0.0,  1.0],
+        [ L_val, 0.0, -1.0],
+        [ 0.0, L_val,  1.0],
+        [ 0.0,-L_val,  1.0],
+    ], dtype=float)
+    M_reach_6 = np.abs(normals_6 @ B)
+
+    C_zono = np.empty((12, 3), dtype=float)
+    M_reach = np.empty((12, 4), dtype=float)
+    C_zono[0::2] = normals_6
+    C_zono[1::2] = -normals_6
+    M_reach[0::2] = M_reach_6
+    M_reach[1::2] = M_reach_6
+    _ZONOTOPE_FACET_CACHE[key] = (C_zono, M_reach)
+    return C_zono, M_reach
+
+
+def scale_wrench_to_zonotope(W, f_bar, L: float = L_SUM) -> tuple:
+    """
+    Bộ co phương lực tổng quát (Radial Zonotope Projection):
+        lambda* = min(1, min_{j: c_j > 0} d_j / c_j),   c = C_zono @ W,   d = M_reach @ f_bar.
+    Giữ nguyên W (lambda* = 1) khi W đã thuộc Zonotope khả thi Z(f_bar); nếu vượt biên,
+    co đồng hướng W_scaled = lambda* * W để bảo toàn tỷ lệ (F_bx, F_by, Tau_bz) và đảm bảo
+    tồn tại nghiệm phân bổ 4 bánh trong hộp [-f_bar, +f_bar]^4.
+    """
+    W_arr = np.asarray(W, dtype=float)
+    f_bar_arr = np.maximum(0.0, np.asarray(f_bar, dtype=float).ravel())
+    C_zono, M_reach = compute_zonotope_facet_matrices(L)
+    c_vec = C_zono @ W_arr
+    d_vec = M_reach @ f_bar_arr
+
+    pos_mask = c_vec > 1e-12
+    if not np.any(pos_mask):
+        return W_arr.copy(), 1.0
+
+    lam_raw = float(np.min(d_vec[pos_mask] / c_vec[pos_mask]))
+    if lam_raw >= 1.0:
+        return W_arr.copy(), 1.0
+
+    # Dự phòng 1e-9 khi chiếu xuống mặt biên tránh is_empty do sai số số học máy
+    lam_star = max(0.0, lam_raw * (1.0 - 1e-9))
+    return lam_star * W_arr, lam_star
+
+
 def compute_feasible_alpha_interval(W, f_bar, L=L_SUM):
     """
     Tính khoảng giá trị khả thi [alpha_lo, alpha_hi] cho biến không gian null alpha
     của ma trận Mecanum B sao cho mọi lực bánh xe thỏa mãn:
         |f_i| <= f_bar_i  (i = 1, 2, 3, 4)
     với f_i = f_pinv_i + alpha * n_i và vector null-space n = [1, 1, -1, -1]^T.
-
-    Xét đầy đủ 4 bánh xe và đổi chiều bất đẳng thức khi n_i < 0:
-    - Bánh 1, 2 (n_i = +1 > 0):
-        alpha >= (-f_bar_i - f_pinv_i) / n_i
-        alpha <= ( f_bar_i - f_pinv_i) / n_i
-    - Bánh 3, 4 (n_i = -1 < 0): Chia cho số âm đảo chiều:
-        alpha >= ( f_bar_i - f_pinv_i) / n_i
-        alpha <= (-f_bar_i - f_pinv_i) / n_i
-
-    Returns:
-        alpha_lo (float): Cận dưới lớn nhất.
-        alpha_hi (float): Cận trên nhỏ nhất.
-        is_empty (bool): True nếu alpha_lo > alpha_hi (Wrench nằm ngoài Zonotope).
     """
-    B = np.array([
-        [1.0,  1.0,  1.0,  1.0],
-        [-1.0, 1.0, -1.0,  1.0],
-        [-L, L, L, -L]
+    # Hàng của B trực giao đôi một: B @ B^T = diag(4, 4, 4*L^2), nên B^+ @ W có dạng giải tích chính xác
+    W_arr = np.asarray(W, dtype=float)
+    fx4 = 0.25 * float(W_arr[0])
+    fy4 = 0.25 * float(W_arr[1])
+    tz4 = float(W_arr[2]) / (4.0 * float(L))
+    f_pinv = np.array([
+        fx4 - fy4 - tz4,
+        fx4 + fy4 + tz4,
+        fx4 - fy4 + tz4,
+        fx4 + fy4 - tz4,
     ], dtype=float)
-    f_pinv = np.linalg.pinv(B) @ np.asarray(W, dtype=float)
     n_vec = np.array([1.0, 1.0, -1.0, -1.0], dtype=float)
 
     lo_bounds = []
@@ -302,17 +361,18 @@ def compute_feasible_alpha_interval(W, f_bar, L=L_SUM):
 
     alpha_lo = float(np.max(lo_bounds))
     alpha_hi = float(np.min(hi_bounds))
-    is_empty = alpha_lo > alpha_hi
+    is_empty = bool(alpha_lo > alpha_hi + 1e-12)
     return alpha_lo, alpha_hi, f_pinv, n_vec, is_empty
 
 
-def allocate_wheel_forces_clamped(W, f_bar, Fz=None, mu=None, L=L_SUM):
+def allocate_wheel_forces_clamped(W, f_bar, Fz=None, mu=None, L=L_SUM, scale_to_zonotope: bool = True):
     """
     Phân bổ lực 4 bánh xe từ Wrench thân xe W với bảo đảm ràng buộc ma sát hộp.
-    Tính alpha* theo nghiệm bình phương tối thiểu có trọng số (weighted least-squares)
-    hoặc unweighted, sau đó kẹp vào đoạn khả thi [alpha_lo, alpha_hi].
+    Khi scale_to_zonotope=True (mặc định), co phương W bằng lambda* vào Zonotope 12 mặt
+    trước khi giải alpha* nhằm ngăn xung lực PD 200/500 Hz làm méo hướng lực và trượt bánh.
     """
-    alpha_lo, alpha_hi, f_pinv, n_vec, is_empty = compute_feasible_alpha_interval(W, f_bar, L)
+    W_use = scale_wrench_to_zonotope(W, f_bar, L)[0] if scale_to_zonotope else np.asarray(W, dtype=float)
+    alpha_lo, alpha_hi, f_pinv, n_vec, is_empty = compute_feasible_alpha_interval(W_use, f_bar, L)
     if Fz is not None and mu is not None:
         weights = 1.0 / np.maximum(1e-4, (mu * np.asarray(Fz))**2)
         denom = float(np.sum(weights * (n_vec**2)))
@@ -322,7 +382,9 @@ def allocate_wheel_forces_clamped(W, f_bar, Fz=None, mu=None, L=L_SUM):
         alpha_star = 0.0
 
     if not is_empty:
-        alpha_clamped = float(np.clip(alpha_star, alpha_lo, alpha_hi))
+        lo_eff = min(alpha_lo, alpha_hi)
+        hi_eff = max(alpha_lo, alpha_hi)
+        alpha_clamped = float(np.clip(alpha_star, lo_eff, hi_eff))
     else:
         alpha_clamped = (alpha_lo + alpha_hi) / 2.0
 

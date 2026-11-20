@@ -161,17 +161,107 @@ class DFEMPCCAMRController:
         self.w_slack_obs = 10000.0   # Biến bù phạt Obstacle ECBF
         self.w_slack_trac = 6000.0   # Biến bù phạt Elip ma sát động (Traction Slack)
         
-        # Bộ đệm warm-start
+        # Bộ đệm warm-start (primal + slack + dual)
         self.x_traj_prev = np.zeros((self.nx, self.N + 1))
         self.u_traj_prev = np.zeros((self.nu, self.N))
-        
+        self._s_slosh_prev = np.zeros((4, self.N))
+        self._s_obs_prev = np.zeros((1, self.N))
+        self._s_zono_prev = np.zeros((12, self.N))
+        self._s_tube_prev = np.zeros((1, self.N))
+        self._s_term_prev = np.zeros((1, 1))
+        self.x_opt_prev = None
+        self.lam_g_prev = None
+        self._last_iter_count = 0
+        self._nlp_fun = None
+        self._ng = 0
+
         self.spline_x = None
         self.spline_y = None
+        self.spline_x_d1 = None
+        self.spline_y_d1 = None
         self.path_length = 0.0
         self.is_path_ready = False
-        
+
+        # Bảng ánh xạ đồng bộ chiều dài cung giữa MPC (s_mpc) và Ống vận tốc (s_tube)
+        self._s_mpc_map = None
+        self._s_tube_map = None
+        self.s_mapping_max_drift_m = 0.0
+
         # Xây dựng bài toán tối ưu
         self._build_solver()
+
+    def reset_warm_start(self):
+        """Đặt lại toàn bộ bộ đệm warm-start primal/slack/dual cho IPOPT."""
+        self.x_traj_prev.fill(0.0)
+        self.u_traj_prev.fill(0.0)
+        self._s_slosh_prev.fill(0.0)
+        self._s_obs_prev.fill(0.0)
+        self._s_zono_prev.fill(0.0)
+        self._s_tube_prev.fill(0.0)
+        self._s_term_prev.fill(0.0)
+        self.x_opt_prev = None
+        self.lam_g_prev = None
+        self._last_iter_count = 0
+
+    def _build_s_tube_mapping(self):
+        """
+        Khớp hình học điểm gần nhất (x, y) giữa tham số dây cung spline của MPC (s_mpc)
+        và tham số độ dài cung mịn của Ống vận tốc (s_tube) bằng phép chiếu đơn điệu
+        trong cửa sổ tiến nhằm tránh nhảy nhánh trên đường cong gấp / hành lang tự tiệm cận.
+        """
+        if not (
+            self.is_path_ready
+            and self.tube_planner is not None
+            and getattr(self.tube_planner, "is_ready", False)
+            and getattr(self.tube_planner, "x_grid", None) is not None
+            and getattr(self.tube_planner, "s_grid", None) is not None
+            and len(self.tube_planner.s_grid) >= 2
+        ):
+            self._s_mpc_map = None
+            self._s_tube_map = None
+            self.s_mapping_max_drift_m = 0.0
+            return
+
+        m_pts = max(int(len(self.tube_planner.s_grid)), 400)
+        s_m = np.linspace(0.0, self.path_length, m_pts)
+        pts_mpc = np.column_stack([self.spline_x(s_m), self.spline_y(s_m)])
+        pts_tube = np.column_stack([self.tube_planner.x_grid, self.tube_planner.y_grid])
+        s_tube_grid = np.asarray(self.tube_planner.s_grid, dtype=float)
+        n_tube = len(s_tube_grid)
+        ds_m = self.path_length / max(1, m_pts - 1)
+        win_lookahead = max(0.45, 5.0 * ds_m)
+
+        nearest_idx = np.empty(m_pts, dtype=int)
+        cur_idx = 0
+        for i in range(m_pts):
+            s_cap = s_tube_grid[0] + max(0.50, 0.10 * float(s_tube_grid[-1])) if i == 0 else (s_tube_grid[cur_idx] + win_lookahead)
+            j_hi = int(np.searchsorted(s_tube_grid, s_cap, side="right"))
+            j_hi = max(cur_idx + 1, min(n_tube, j_hi))
+            diff_w = pts_tube[cur_idx:j_hi] - pts_mpc[i]
+            d2_w = diff_w[:, 0] ** 2 + diff_w[:, 1] ** 2
+            cur_idx = cur_idx + int(np.argmin(d2_w))
+            nearest_idx[i] = cur_idx
+
+        s_t = np.asarray(s_tube_grid[nearest_idx], dtype=float).copy()
+        s_t[0] = 0.0
+        s_t[-1] = float(s_tube_grid[-1])
+        s_t = np.maximum.accumulate(s_t)
+
+        self._s_mpc_map = s_m
+        self._s_tube_map = s_t
+        self.s_mapping_max_drift_m = float(np.max(np.abs(s_t - s_m)))
+
+    def map_s_mpc_to_tube(self, s_mpc):
+        """Quy đổi tọa độ cung s của MPC sang s của Ống vận tốc H124."""
+        is_scalar = np.isscalar(s_mpc)
+        s_arr = np.asarray(s_mpc, dtype=float)
+        if self._s_mpc_map is not None and self._s_tube_map is not None:
+            mapped = np.interp(s_arr, self._s_mpc_map, self._s_tube_map)
+        elif self.tube_planner is not None and getattr(self.tube_planner, "is_ready", False):
+            mapped = np.clip(s_arr, 0.0, float(self.tube_planner.s_grid[-1]))
+        else:
+            mapped = s_arr
+        return float(mapped) if is_scalar else mapped
 
     def set_path(self, waypoints):
         """Nạp quỹ đạo toàn cục và khớp Cubic Spline trơn C^2."""
@@ -182,12 +272,17 @@ class DFEMPCCAMRController:
         self.path_length = float(s_nodes[-1])
         self.spline_x = CubicSpline(s_nodes, waypoints[:, 0])
         self.spline_y = CubicSpline(s_nodes, waypoints[:, 1])
+        self.spline_x_d1 = self.spline_x.derivative()
+        self.spline_y_d1 = self.spline_y.derivative()
         self.is_path_ready = True
+        self.reset_warm_start()
+        self._build_s_tube_mapping()
         print(f"[DFE-MPCC] Đã nạp thành công quỹ đạo tham chiếu: Chiều dài L = {self.path_length:.3f} m ({len(waypoints)} điểm).")
 
     def set_tube_planner(self, tube_planner):
         """Liên kết mô-đun Ống vận tốc khả thi bậc 3 Krasnoselskii-Mann (H124) vào bộ giải tối ưu NLP."""
         self.tube_planner = tube_planner
+        self._build_s_tube_mapping()
         n_pts = len(tube_planner.s_grid) if getattr(tube_planner, "is_ready", False) else 0
         print(f"[DFE-MPCC] Đã tích hợp Ống vận tốc khả thi bậc 3 Krasnoselskii-Mann vào Solver ({n_pts} điểm lưới).")
 
@@ -198,8 +293,8 @@ class DFEMPCCAMRController:
         s_clamped = np.clip(s_val, 0.0, self.path_length)
         xr = float(self.spline_x(s_clamped))
         yr = float(self.spline_y(s_clamped))
-        dxr = float(self.spline_x.derivative()(s_clamped))
-        dyr = float(self.spline_y.derivative()(s_clamped))
+        dxr = float(self.spline_x_d1(s_clamped))
+        dyr = float(self.spline_y_d1(s_clamped))
         norm_d = np.hypot(dxr, dyr) + 1e-9
         tx = dxr / norm_d
         ty = dyr / norm_d
@@ -429,17 +524,32 @@ class DFEMPCCAMRController:
 
         opti.minimize(cost)
         
-        # Thiết lập bộ giải IPOPT (Cải tiến U2: giới hạn max_iter cắt đuôi trễ P95)
-        opts_p = {'expand': True, 'print_time': False}
+        # Thiết lập bộ giải IPOPT thời gian thực (adaptive barrier + primal-dual warm-start + to_function)
+        opts_p = {'expand': True, 'print_time': False, 'error_on_fail': False}
         opts_s = {
             'max_iter': self.ipopt_max_iter,
             'print_level': 0,
+            'sb': 'yes',
             'tol': 1e-2,
-            'warm_start_init_point': 'yes',
             'acceptable_tol': 5e-2,
-            'acceptable_iter': 4
+            'acceptable_iter': 2,
+            'mu_strategy': 'adaptive',
+            'warm_start_init_point': 'yes',
+            'warm_start_bound_push': 5e-6,
+            'warm_start_slack_bound_push': 5e-6,
+            'warm_start_mult_bound_push': 5e-6,
         }
         opti.solver('ipopt', opts_p, opts_s)
+        self._nlp_fun = opti.to_function(
+            'dfe_mpcc_nlp',
+            [
+                P_x0, P_path_p, P_path_t, P_path_sbar, P_th_path, P_phi_est, P_obs,
+                P_mu, P_q_eta, P_dfz_iso, P_v_ub, P_v_lb,
+                X, U, s_slosh, s_obs, s_zono, s_tube, s_term_slosh, opti.lam_g,
+            ],
+            [X, U, s_slosh, s_obs, s_zono, s_tube, s_term_slosh, opti.lam_g],
+        )
+        self._ng = int(opti.ng)
         
         self.opti = opti
         self.X = X
@@ -479,29 +589,35 @@ class DFEMPCCAMRController:
         else:
             dfz_iso_vec = np.asarray(dfz_iso, dtype=float).reshape(4)
             
-        # 1. Trích xuất tham số tham chiếu dọc chuỗi s dự báo
-        path_p = np.zeros((2, self.N))
-        path_t = np.zeros((2, self.N))
-        path_sbar = np.zeros((1, self.N))
-        th_path = np.zeros((1, self.N))
-        
+        # 1. Trích xuất tham số tham chiếu dọc chuỗi s dự báo (vector hóa)
         s_cur = float(np.clip(x_current[9], 0.0, self.path_length))
         vs_cur = float(np.clip(x_current[10], 0.05, 0.75))
         vs_preview = max(vs_cur, 0.40)
-        
+
+        s_vec = np.clip(s_cur + np.arange(self.N, dtype=float) * self.dt * vs_preview, 0.0, self.path_length)
+        path_sbar = s_vec.reshape(1, self.N)
         prev_h = float(x_current[2])
-        for k in range(self.N):
-            s_k = float(np.clip(s_cur + k * self.dt * vs_preview, 0.0, self.path_length))
-            p_ref, t_ref, heading = self.get_path_reference(s_k)
-            path_p[:, k] = p_ref
-            path_t[:, k] = t_ref
-            path_sbar[0, k] = s_k
-            
-            d_th = np.arctan2(np.sin(heading - prev_h), np.cos(heading - prev_h))
-            prev_h = prev_h + d_th
-            th_path[0, k] = prev_h
-            
-        # 2. Nạp tham số vào bộ giải
+        th_path = np.zeros((1, self.N))
+        if self.is_path_ready and self.spline_x_d1 is not None and self.spline_y_d1 is not None:
+            px = self.spline_x(s_vec)
+            py = self.spline_y(s_vec)
+            dx = self.spline_x_d1(s_vec)
+            dy = self.spline_y_d1(s_vec)
+            nrm = np.hypot(dx, dy) + 1e-9
+            path_p = np.vstack([px, py])
+            path_t = np.vstack([dx / nrm, dy / nrm])
+            hd = np.arctan2(dy, dx)
+            for k in range(self.N):
+                prev_h = prev_h + float(np.arctan2(np.sin(hd[k] - prev_h), np.cos(hd[k] - prev_h)))
+                th_path[0, k] = prev_h
+        else:
+            path_p = np.zeros((2, self.N))
+            path_t = np.vstack([np.ones(self.N), np.zeros(self.N)])
+            th_path.fill(prev_h)
+
+        s_preview_tube = self.map_s_mpc_to_tube(path_sbar[0, :])
+
+        # 2. Nạp tham số ma sát & ống vận tốc
         if mu_horizon is not None:
             mu_plan_vec = np.asarray(mu_horizon, dtype=float).reshape(1, self.N)
         elif mu_floor is not None:
@@ -510,83 +626,137 @@ class DFEMPCCAMRController:
             else:
                 mu_plan_vec = np.full((1, self.N), float(mu_floor) * self.mu_plan_scale)
         elif self.tube_planner is not None and getattr(self.tube_planner, "is_ready", False) and getattr(self.tube_planner, "mu_grid", None) is not None:
-            mu_plan_vec = self.tube_planner.get_horizon_mu_plan(path_sbar[0, :]).reshape(1, self.N)
+            mu_plan_vec = self.tube_planner.get_horizon_mu_plan(s_preview_tube).reshape(1, self.N)
         else:
             mu_plan_vec = np.full((1, self.N), float(self.default_mu) * self.mu_plan_scale)
         mu_plan_vec = np.maximum(0.05, mu_plan_vec)
 
-        self.opti.set_value(self.P_x0, x_current)
-        self.opti.set_value(self.P_path_p, path_p)
-        self.opti.set_value(self.P_path_t, path_t)
-        self.opti.set_value(self.P_path_sbar, path_sbar)
-        self.opti.set_value(self.P_th_path, th_path)
-        self.opti.set_value(self.P_phi_est, phi_est)
-        self.opti.set_value(self.P_obs, obs_info)
-        self.opti.set_value(self.P_mu, mu_plan_vec)
-        self.opti.set_value(self.P_q_eta, q_eta_apply)
-        self.opti.set_value(self.P_dfz_iso, dfz_iso_vec)
-        
-        # Trích xuất trần vận tốc v_ub và sàn v_lb dọc theo chân trời dự báo N_p từ Ống Krasnoselskii-Mann
         if v_ub_horizon is not None:
             v_ub_vec = np.asarray(v_ub_horizon, dtype=float).reshape(1, self.N)
             v_lb_vec = np.asarray(v_lb_horizon, dtype=float).reshape(1, self.N) if v_lb_horizon is not None else np.zeros((1, self.N))
         elif self.tube_planner is not None and getattr(self.tube_planner, "is_ready", False):
-            s_preview = path_sbar[0, :]
-            v_ub_interp = np.interp(s_preview, self.tube_planner.s_grid, self.tube_planner.v_ub_nom)
-            v_ub_vec = np.clip(v_ub_interp, 0.25, 0.65).reshape(1, self.N)
+            v_ub_interp = np.interp(s_preview_tube, self.tube_planner.s_grid, self.tube_planner.v_ub_nom)
+            v_ub_vec = np.clip(v_ub_interp, 0.15, 0.70).reshape(1, self.N)
             v_lb_vec = np.zeros((1, self.N))
         else:
             v_ub_vec = np.full((1, self.N), 0.60)
             v_lb_vec = np.zeros((1, self.N))
-            
-        self.opti.set_value(self.P_v_ub, v_ub_vec)
-        self.opti.set_value(self.P_v_lb, v_lb_vec)
-        
-        # 3. Warm start từ chu kỳ trước
+
+        # 3. Warm start primal + slack + dual dịch chuyển từ chu kỳ trước
         if np.any(self.x_traj_prev != 0):
             x_init = np.zeros((self.nx, self.N + 1))
             x_init[:, :-1] = self.x_traj_prev[:, 1:]
             x_init[:, -1] = self.x_traj_prev[:, -1]
-            self.opti.set_initial(self.X, x_init)
-            
             u_init = np.zeros((self.nu, self.N))
             u_init[:, :-1] = self.u_traj_prev[:, 1:]
             u_init[:, -1] = self.u_traj_prev[:, -1]
-            self.opti.set_initial(self.U, u_init)
-            
-        # 4. Giải tối ưu NLP
-        try:
-            sol = self.opti.solve()
-            x_pred = sol.value(self.X)
-            u_pred = sol.value(self.U)
-            u_opt = u_pred[0:3, 0]
-            js_opt = float(u_pred[3, 0])
-            slack_zono_val = float(np.max(sol.value(self.s_zono)))
-            slack_tube_val = float(np.max(sol.value(self.s_tube)))
+        else:
+            x_init = np.zeros((self.nx, self.N + 1))
+            u_init = np.zeros((self.nu, self.N))
+        lam_init = self.lam_g_prev if self.lam_g_prev is not None else np.zeros(self._ng, dtype=float)
+
+        # 4. Giải tối ưu NLP qua CasADi Function đã biên dịch (to_function)
+        Xo, Uo, s_sl_o, s_ob_o, s_zo_o, s_tu_o, s_te_o, lam_o = self._nlp_fun(
+            x_current,
+            path_p,
+            path_t,
+            path_sbar,
+            th_path,
+            phi_est,
+            obs_info,
+            mu_plan_vec,
+            q_eta_apply,
+            dfz_iso_vec,
+            v_ub_vec,
+            v_lb_vec,
+            x_init,
+            u_init,
+            self._s_slosh_prev,
+            self._s_obs_prev,
+            self._s_zono_prev,
+            self._s_tube_prev,
+            self._s_term_prev,
+            lam_init,
+        )
+
+        stats = self._nlp_fun.stats()
+        is_ok = bool(stats.get('success', False))
+        iter_count = int(stats.get('iter_count', -1))
+
+        x_pred = np.asarray(Xo, dtype=float)
+        u_pred = np.asarray(Uo, dtype=float)
+        s_sl_np = np.asarray(s_sl_o, dtype=float).reshape(4, self.N)
+        s_ob_np = np.asarray(s_ob_o, dtype=float).reshape(1, self.N)
+        s_zo_np = np.asarray(s_zo_o, dtype=float).reshape(12, self.N)
+        s_tu_np = np.asarray(s_tu_o, dtype=float).reshape(1, self.N)
+        s_te_np = np.asarray(s_te_o, dtype=float).reshape(1, 1)
+        lam_out = np.asarray(lam_o, dtype=float).ravel()
+
+        xu_finite = bool(np.all(np.isfinite(x_pred)) and np.all(np.isfinite(u_pred)))
+        all_finite = bool(
+            xu_finite
+            and np.all(np.isfinite(s_sl_np))
+            and np.all(np.isfinite(s_ob_np))
+            and np.all(np.isfinite(s_zo_np))
+            and np.all(np.isfinite(s_tu_np))
+            and np.all(np.isfinite(s_te_np))
+            and np.all(np.isfinite(lam_out))
+        )
+        if not all_finite:
+            is_ok = False
+            if not np.all(np.isfinite(x_pred)):
+                x_pred = np.zeros((self.nx, self.N + 1), dtype=float)
+            if not np.all(np.isfinite(u_pred)):
+                u_pred = np.zeros((self.nu, self.N), dtype=float)
+            s_sl_np = np.zeros((4, self.N), dtype=float)
+            s_ob_np = np.zeros((1, self.N), dtype=float)
+            s_zo_np = np.zeros((12, self.N), dtype=float)
+            s_tu_np = np.zeros((1, self.N), dtype=float)
+            s_te_np = np.zeros((1, 1), dtype=float)
+            lam_out = np.zeros(self._ng, dtype=float)
+
+        u_opt = u_pred[0:3, 0].copy()
+        js_opt = float(u_pred[3, 0])
+        slack_zono_val = float(np.max(s_zo_np))
+        slack_tube_val = float(np.max(s_tu_np))
+
+        if is_ok:
             status = 'optimal'
-        except Exception:
-            x_pred = self.opti.debug.value(self.X)
-            u_pred = self.opti.debug.value(self.U)
-            u_opt = u_pred[0:3, 0]
-            js_opt = float(u_pred[3, 0])
-            slack_zono_val = float(np.max(self.opti.debug.value(self.s_zono)))
-            slack_tube_val = float(np.max(self.opti.debug.value(self.s_tube)))
+            self._s_slosh_prev = s_sl_np
+            self._s_obs_prev = s_ob_np
+            self._s_zono_prev = s_zo_np
+            self._s_tube_prev = s_tu_np
+            self._s_term_prev = s_te_np
+            self.lam_g_prev = lam_out
+            self.x_opt_prev = x_pred
+            self.x_traj_prev = x_pred.copy()
+            self.u_traj_prev = u_pred.copy()
+        else:
             status = 'suboptimal_fallback'
-            # Nghiệm debug của IPOPT có thể vi phạm hộp jerk; kẹp lại để lệnh áp dụng
+            # Nghiệm fallback của IPOPT có thể vi phạm hộp jerk; kẹp lại để lệnh áp dụng
             # luôn nằm trong giới hạn |j_xy| <= 4, |j_th| <= 6, |js| <= 8.
-            u_opt = np.array(u_opt, dtype=float).copy()
             u_opt[0:2] = np.clip(u_opt[0:2], -4.0, 4.0)
             u_opt[2] = float(np.clip(u_opt[2], -6.0, 6.0))
             js_opt = float(np.clip(js_opt, -8.0, 8.0))
-            
-        self.x_traj_prev = x_pred.copy()
-        self.u_traj_prev = u_pred.copy()
-        
+            self.lam_g_prev = None
+            self.x_opt_prev = None
+            self._s_slosh_prev.fill(0.0)
+            self._s_obs_prev.fill(0.0)
+            self._s_zono_prev.fill(0.0)
+            self._s_tube_prev.fill(0.0)
+            self._s_term_prev.fill(0.0)
+            if xu_finite:
+                self.x_traj_prev = x_pred.copy()
+                self.u_traj_prev = u_pred.copy()
+
+        self._last_iter_count = iter_count
+
         t_solve_ms = (time.time() - t_start) * 1000.0
         
         extra_info = {
             'solve_time_ms': t_solve_ms,
             'status': status,
+            'iter_count': iter_count,
             'slack_tube': slack_tube_val,
             'v_ub_preview': v_ub_vec.flatten(),
             'mu_plan_preview': mu_plan_vec.flatten(),

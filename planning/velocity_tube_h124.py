@@ -208,6 +208,7 @@ class CoupledVelocityTubeH124:
         self.s_grid = None
         self.x_grid = None
         self.y_grid = None
+        self.yaw_grid = None
         self.kappa_grid = None
         self.dkappa_grid = None
         self.dkappa_spline_grid = None
@@ -367,6 +368,8 @@ class CoupledVelocityTubeH124:
             self.dkappa_spline_grid = (dnum_s * den_s - num_s * dden_s) / ((den_s ** 2) * sp_s)
             self.x_grid = x_at_s
             self.y_grid = y_at_s
+            sign_x = 1.0 if float(waypoints[-1, 0] - waypoints[0, 0]) >= 0.0 else -1.0
+            self.yaw_grid = np.arctan2(sign_x * y1, np.full_like(y1, sign_x))
         else:
             diffs = np.diff(waypoints, axis=0)
             seg_lens = np.hypot(diffs[:, 0], diffs[:, 1])
@@ -428,6 +431,7 @@ class CoupledVelocityTubeH124:
             self.dkappa_spline_grid = dkappa.copy()
             self.x_grid = cs_x_u(u_at_s)
             self.y_grid = cs_y_u(u_at_s)
+            self.yaw_grid = np.arctan2(y1, x1)
 
         # Trích xuất các vùng khúc cua tổng quát cho mọi bản đồ và chiều dài quỹ đạo A*
         n = len(s_grid)
@@ -1463,7 +1467,12 @@ class CoupledVelocityTubeH124:
 
         n = len(s_grid)
         if friction_estimator is not None:
-            f_res = friction_estimator.predict_along_path(self.x_grid, self.y_grid, mode=friction_mode)
+            f_res = friction_estimator.predict_along_path(
+                self.x_grid,
+                self.y_grid,
+                mode=friction_mode,
+                yaw_grid=getattr(self, "yaw_grid", None),
+            )
             mu_grid = np.asarray(f_res["mu_tube"], dtype=float)
             self.mu_hat_grid = np.asarray(f_res["mu_mean"], dtype=float)
             self.sigma_mu_grid = np.asarray(f_res["sigma_gp"], dtype=float)
@@ -1473,9 +1482,15 @@ class CoupledVelocityTubeH124:
             self.friction_meta = {
                 "source": type(friction_estimator).__name__,
                 "mode": str(f_res.get("mode", friction_mode)),
+                "query_mode": str(f_res.get("query_mode", "footprint")),
                 "q_hat_mu": float(f_res.get("q_hat_mu", 0.0)),
                 "alpha_mu": float(f_res.get("alpha_mu", 0.0)),
                 "n_support": int(f_res.get("n_support", 0)),
+                "erosion_radius_m": float(f_res.get("erosion_radius_m", 0.0)),
+                "use_raster_cache": bool(f_res.get("use_raster_cache", False)),
+                "grid_res_m": float(f_res.get("grid_res_m", 0.0)),
+                "prior_region_frac": float(f_res.get("prior_region_frac", 0.0)),
+                "clamped_mu_min_frac": float(f_res.get("clamped_mu_min_frac", 0.0)),
                 "predict_time_ms": round(self.friction_predict_time_ms, 4),
             }
         else:
@@ -1490,7 +1505,11 @@ class CoupledVelocityTubeH124:
             self.mu_lcb_grid = mu_grid.copy()
             self.mu_is_conformal_safe = False
             self.friction_predict_time_ms = 0.0
-            self.friction_meta = {"source": "mu_profile" if mu_profile is not None else "mu_default"}
+            self.friction_meta = {
+                "source": "mu_profile" if mu_profile is not None else "mu_default",
+                "prior_region_frac": 0.0,
+                "clamped_mu_min_frac": 0.0,
+            }
 
         if apply_plan_scale is None:
             self.mu_effective_plan_scale = 1.0 if (friction_estimator is not None and self.mu_is_conformal_safe) else self.mu_plan_scale
@@ -1767,6 +1786,8 @@ class CoupledVelocityTubeH124:
             "plan_time_total_ms": round(self.plan_time_total_ms, 2),
             "conformal_lookup_time_ms": round(self.conformal_lookup_time_ms, 4),
             "friction_predict_time_ms": round(self.friction_predict_time_ms, 4),
+            "friction_prior_region_frac": round(float(self.friction_meta.get("prior_region_frac", 0.0)), 4),
+            "friction_clamped_mu_min_frac": round(float(self.friction_meta.get("clamped_mu_min_frac", 0.0)), 4),
             "mu_is_conformal_safe": bool(self.mu_is_conformal_safe),
             "mu_effective_plan_scale": round(float(self.mu_effective_plan_scale), 4),
             "mu_tube_min": round(float(np.min(mu_grid)), 4),

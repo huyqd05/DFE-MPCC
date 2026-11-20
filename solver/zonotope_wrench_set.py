@@ -16,18 +16,30 @@ Mục đích:
 =============================================================================
 """
 
+import os
 import sys
 import numpy as np
 import casadi as cs
 
+_curr = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.dirname(_curr) if os.path.basename(_curr) in ["solver", "controller"] else _curr
+for _p in [_root, os.path.join(_root, "controller")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from controller.mecanum_traction_dynamics import (
+    L_X,
+    L_Y,
+    L_SUM,
+    compute_zonotope_facet_matrices,
+    scale_wrench_to_zonotope,
+    compute_feasible_alpha_interval,
+    allocate_wheel_forces_clamped,
+)
+
 # Đảm bảo in tiếng Việt trên console Windows
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
-
-# Thông số hình học cơ sở Mecanum (slosh3.xml & robot_model_amr_casadi.py)
-L_X = 0.12          # m
-L_Y = 0.14          # m
-L_SUM = L_X + L_Y   # 0.26 m
 
 
 def get_mecanum_matrix_B(L=L_SUM):
@@ -66,47 +78,7 @@ def compute_zonotope_facet_matrices_G(L=L_SUM):
 
 
 
-def compute_zonotope_facet_matrices(L=L_SUM):
-    """
-    Tính ma trận pháp tuyến C_zono (12 x 3) và ma trận ánh xạ bán kính M_reach (12 x 4)
-    sao cho điều kiện W in Z(f_bar) tương đương với:
-        C_zono @ W <= M_reach @ f_bar = d_zono
-    
-    Trong đó f_bar = [f_bar_1, f_bar_2, f_bar_3, f_bar_4]^T là giới hạn bám của 4 bánh xe:
-        f_bar_i = (mu_i * F_z,i) / sqrt(2)
-    """
-    # 6 vector pháp tuyến của 6 cặp mặt đối xứng (tích có hướng b_i x b_j)
-    # b1 = [1, -1, -L]^T
-    # b2 = [1,  1,  L]^T
-    # b3 = [1, -1,  L]^T
-    # b4 = [1,  1, -L]^T
-    normals_6 = np.array([
-        [ 1.0,  1.0,  0.0],   # n1 từ b1 x b3 = [-2L, -2L, 0] ~ [1, 1, 0]
-        [-1.0,  1.0,  0.0],   # n2 từ b2 x b4 = [-2L,  2L, 0] ~ [-1, 1, 0]
-        [   L,  0.0,  1.0],   # n3 từ b1 x b4 = [2L, 0, 2]    ~ [L, 0, 1]
-        [   L,  0.0, -1.0],   # n4 từ b2 x b3 = [2L, 0, -2]   ~ [L, 0, -1]
-        [ 0.0,    L,  1.0],   # n5 từ b3 x b4 = [0, 2L, 2]    ~ [0, L, 1]
-        [ 0.0,   -L,  1.0],   # n6 từ b1 x b2 = [0, -2L, 2]   ~ [0, -L, 1]
-    ], dtype=float)
-
-    B = get_mecanum_matrix_B(L) # 3 x 4
-
-    # Tính bán kính vươn cực đại d_k = sum_i |n_k^T * b_i| * f_bar_i
-    # M_reach_6: (6 x 4) với M_reach_6[k, i] = |n_k^T * b_i|
-    M_reach_6 = np.abs(normals_6 @ B) # (6 x 4)
-
-    # Ghép thành 12 mặt biên (gồm 6 chiều dương và 6 chiều âm)
-    # C_zono (12 x 3): [+n1, -n1, +n2, -n2, ..., +n6, -n6]^T
-    C_zono = np.zeros((12, 3), dtype=float)
-    M_reach = np.zeros((12, 4), dtype=float)
-
-    for k in range(6):
-        C_zono[2 * k]     =  normals_6[k]
-        C_zono[2 * k + 1] = -normals_6[k]
-        M_reach[2 * k]     = M_reach_6[k]
-        M_reach[2 * k + 1] = M_reach_6[k]
-
-    return C_zono, M_reach
+# compute_zonotope_facet_matrices được chia sẻ trực tiếp từ controller.mecanum_traction_dynamics (tránh trùng lặp)
 
 
 def check_wrench_feasibility(W, f_bar, L=L_SUM, tol=1e-6):
@@ -157,72 +129,6 @@ def build_casadi_zonotope_function(L=L_SUM):
     return fn_zonotope
 
 
-def compute_feasible_alpha_interval(W, f_bar, L=L_SUM):
-    """
-    Tính khoảng giá trị khả thi [alpha_lo, alpha_hi] cho biến không gian null alpha
-    của ma trận Mecanum B sao cho mọi lực bánh xe thỏa mãn:
-        |f_i| <= f_bar_i  (i = 1, 2, 3, 4)
-    với f_i = f_pinv_i + alpha * n_i và vector null-space n = [1, 1, -1, -1]^T.
-
-    Xét đầy đủ cả 4 bánh xe và đảo chiều bất đẳng thức khi n_i < 0:
-    - Bánh 1, 2 (n_i = +1 > 0):
-        alpha >= (-f_bar_i - f_pinv_i) / n_i
-        alpha <= ( f_bar_i - f_pinv_i) / n_i
-    - Bánh 3, 4 (n_i = -1 < 0):
-        alpha >= ( f_bar_i - f_pinv_i) / n_i
-        alpha <= (-f_bar_i - f_pinv_i) / n_i
-
-    Returns:
-        alpha_lo (float): Cận dưới lớn nhất.
-        alpha_hi (float): Cận trên nhỏ nhất.
-        f_pinv (np.ndarray): Nghiệm giả nghịch đảo Moore-Penrose.
-        n_vec (np.ndarray): Vector cơ sở hạch ker(B).
-        is_empty (bool): True nếu alpha_lo > alpha_hi (Wrench nằm ngoài Zonotope).
-    """
-    B = get_mecanum_matrix_B(L)
-    f_pinv = np.linalg.pinv(B) @ np.asarray(W, dtype=float)
-    n_vec = np.array([1.0, 1.0, -1.0, -1.0], dtype=float)
-
-    lo_bounds = []
-    hi_bounds = []
-    for i in range(4):
-        if n_vec[i] > 0.0:
-            lo_bounds.append((-f_bar[i] - f_pinv[i]) / n_vec[i])
-            hi_bounds.append(( f_bar[i] - f_pinv[i]) / n_vec[i])
-        else:
-            lo_bounds.append(( f_bar[i] - f_pinv[i]) / n_vec[i])
-            hi_bounds.append((-f_bar[i] - f_pinv[i]) / n_vec[i])
-
-    alpha_lo = float(np.max(lo_bounds))
-    alpha_hi = float(np.min(hi_bounds))
-    is_empty = bool(alpha_lo > alpha_hi + 1e-12)
-    return alpha_lo, alpha_hi, f_pinv, n_vec, is_empty
-
-
-def allocate_wheel_forces_clamped(W, f_bar, Fz=None, mu=None, L=L_SUM):
-    """
-    Phân bổ lực 4 bánh xe từ Wrench thân xe W với bảo đảm ràng buộc ma sát hộp.
-    Tính alpha* theo nghiệm bình phương tối thiểu có trọng số (weighted least-squares),
-    sau đó kẹp vào đoạn khả thi [alpha_lo, alpha_hi].
-    """
-    alpha_lo, alpha_hi, f_pinv, n_vec, is_empty = compute_feasible_alpha_interval(W, f_bar, L)
-    if Fz is not None and mu is not None:
-        weights = 1.0 / np.maximum(1e-4, (mu * np.asarray(Fz))**2)
-        denom = float(np.sum(weights * (n_vec**2)))
-        numer = float(np.sum(weights * n_vec * f_pinv))
-        alpha_star = -numer / denom if denom > 1e-12 else 0.0
-    else:
-        alpha_star = 0.0
-
-    if not is_empty:
-        alpha_clamped = float(np.clip(alpha_star, alpha_lo, alpha_hi))
-    else:
-        alpha_clamped = (alpha_lo + alpha_hi) / 2.0
-
-    f_alloc = f_pinv + alpha_clamped * n_vec
-    return f_alloc, alpha_clamped, (alpha_lo, alpha_hi, alpha_star)
-
-
 def verify_zonotope_against_lp(n_samples=500, seed=999, L=L_SUM):
     """
     Kiểm chứng độc lập độ chặt của 12 mặt bao Zonotope T1 bằng quy hoạch tuyến tính (LP).
@@ -243,11 +149,11 @@ def verify_zonotope_against_lp(n_samples=500, seed=999, L=L_SUM):
         scale = np.random.uniform(0.2, 1.8)
         u_rand = np.random.uniform(-f_bar_nominal, f_bar_nominal) * scale
         W = B @ u_rand
-        
+
         zono_feasible = bool(np.all(C_zono @ W <= d + 1e-7))
         res = linprog(c=np.zeros(4), A_eq=B, b_eq=W, bounds=[(-f, f) for f in f_bar_nominal], method='highs')
         lp_feasible = bool(res.success)
-        
+
         if zono_feasible:
             n_feas += 1
         else:
@@ -255,7 +161,7 @@ def verify_zonotope_against_lp(n_samples=500, seed=999, L=L_SUM):
 
         if zono_feasible == lp_feasible:
             matches += 1
-            
+
     match_rate = (matches / n_samples) * 100.0
     return matches, n_samples, match_rate, n_feas, n_infeas
 
@@ -278,8 +184,8 @@ class ZonotopeWrenchSet:
     def get_casadi_function(self):
         return build_casadi_zonotope_function(self.L)
 
-    def allocate(self, W, f_bar, Fz=None, mu=None):
-        return allocate_wheel_forces_clamped(W, f_bar, Fz, mu, self.L)
+    def allocate(self, W, f_bar, Fz=None, mu=None, scale_to_zonotope: bool = True):
+        return allocate_wheel_forces_clamped(W, f_bar, Fz, mu, self.L, scale_to_zonotope=scale_to_zonotope)
 
 
 if __name__ == "__main__":
