@@ -203,11 +203,15 @@ class SimpatRos2RvizHeadlessNode(Node):
     def _build_static_occupancy_grid(self) -> RosOccupancyGrid:
         """Tạo bản đồ lưới chiếm chỗ 2D chuẩn nav_msgs/OccupancyGrid từ cả tường hộp và trụ tròn."""
         res = 0.05
-        is_w8 = (self.map_name == "world8.xml")
-        width = 140 if is_w8 else 128   # 7.0 m vs 6.4 m
-        height = 140 if is_w8 else 128
-        origin_x = -3.5 if is_w8 else -3.2
-        origin_y = -3.5 if is_w8 else -3.2
+        if self.map_name == "world9.xml":
+            width = height = 156   # 7.8 m phủ trọn [-3.9, +3.9] của world9 (7.2 x 7.2 m)
+            origin_x = origin_y = -3.9
+        elif self.map_name == "world8.xml":
+            width = height = 140   # 7.0 m
+            origin_x = origin_y = -3.5
+        else:
+            width = height = 128   # 6.4 m
+            origin_x = origin_y = -3.2
 
         grid_data = np.zeros((height, width), dtype=np.int8)
         xs = origin_x + (np.arange(width) + 0.5) * res

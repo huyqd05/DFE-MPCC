@@ -47,6 +47,7 @@ import sys
 import json
 import time
 import numpy as np
+_np_trapezoid = getattr(np, "trapezoid", None) or getattr(np, "trapz")
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import lfilter
@@ -485,7 +486,7 @@ class CoupledVelocityTubeH124:
             # Pha 2: Lọc bỏ gợn yếu có góc đổi hướng tích lũy < dpsi_min = 0.199 rad
             valid_corners = []
             for i_s, i_p, i_e in merged_regs:
-                dpsi = float(np.trapezoid(np.abs(kappa[i_s:i_e + 1]), s_grid[i_s:i_e + 1]))
+                dpsi = float(_np_trapezoid(np.abs(kappa[i_s:i_e + 1]), s_grid[i_s:i_e + 1]))
                 if dpsi >= dpsi_min:
                     valid_corners.append({
                         "idx_in": int(i_s),
@@ -1258,7 +1259,7 @@ class CoupledVelocityTubeH124:
                 mask_link = (self.s_grid >= s_prev_cp) & (self.s_grid <= cp["s_peak"])
                 if np.sum(mask_link) >= 2:
                     inv_v_link = 1.0 / np.maximum(geom_prof["v_ref_geom"][mask_link], 0.08)
-                    t_link = float(np.trapezoid(inv_v_link, self.s_grid[mask_link]))
+                    t_link = float(_np_trapezoid(inv_v_link, self.s_grid[mask_link]))
                 else:
                     t_link = ds_link_cp / max(float(geom_prof["v_ref_geom"][idx_p]), 0.08)
                 gamma_link_cp = float(np.exp(-ZETA_SLOSH * omega_1y * t_link))
@@ -1269,7 +1270,7 @@ class CoupledVelocityTubeH124:
             ax_geom_cp = float(geom_prof["ax_ref_geom"][idx_eta_geom_max])
             ay_geom_cp = float(geom_prof["ay_ref_geom"][idx_ay_geom_max])
             a_tot_geom_cp = float(np.hypot(ax_geom_cp, ay_geom_cp))
-            delta_psi_cp = float(np.trapezoid(self.kappa_grid[sl], self.s_grid[sl])) if idx_out > idx_in else 0.0
+            delta_psi_cp = float(_np_trapezoid(self.kappa_grid[sl], self.s_grid[sl])) if idx_out > idx_in else 0.0
 
             cp["delta_psi_rad"] = delta_psi_cp
             cp["ds_link_m"] = ds_link_cp
