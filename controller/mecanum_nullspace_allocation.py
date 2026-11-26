@@ -134,22 +134,38 @@ def allocate_chassis_wrench(w_cmd, Fz_wheels, mu=0.12, use_nullspace=True):
 
 
 def allocate_mecanum_wheel_forces_guaranteed(
-    W_cmd: np.ndarray, f_bar: np.ndarray, lx: float = L_X, ly: float = L_Y, weights_w: np.ndarray = None
+    W_cmd: np.ndarray,
+    f_bar: np.ndarray,
+    lx: float = L_X,
+    ly: float = L_Y,
+    weights_w: np.ndarray = None,
+    wheel_order: str = "FL_FR_RR_RL",
 ) -> dict:
     """
     Khôi phục lực vô hướng 4 bánh f_w từ wrench lệnh W_cmd = [Fx, Fy, Mz]^T
     sao cho |f_w| <= f_bar[w] với mọi w ∈ {0, 1, 2, 3} bất cứ khi nào W_cmd nằm trong Zonotope.
+    Mặc định dùng thứ tự 4 bánh thống nhất toàn codebase: [FL, FR, RR, RL].
     (Khắc phục triệt để Lỗi A.8 - Không nhân trùng 1/sqrt(2) ở f_bar).
     """
     c45 = 1.0 / np.sqrt(2.0)
     L_sum = lx + ly
     # Ma trận phân bổ G (3x4) chứa duy nhất 1 lần hệ số 1/sqrt(2)
-    G = c45 * np.array([
-        [ 1.0,  1.0,  1.0,  1.0],
-        [-1.0,  1.0,  1.0, -1.0],
-        [-L_sum, L_sum, -L_sum, L_sum]
-    ])
+    if wheel_order == "FL_FR_RR_RL":
+        G = c45 * np.array([
+            [ 1.0,   1.0,   1.0,   1.0],
+            [-1.0,   1.0,  -1.0,   1.0],
+            [-L_sum, L_sum, L_sum, -L_sum],
+        ])
+    elif wheel_order == "FL_FR_RL_RR":
+        G = c45 * np.array([
+            [ 1.0,   1.0,    1.0,   1.0],
+            [-1.0,   1.0,    1.0,  -1.0],
+            [-L_sum, L_sum, -L_sum, L_sum],
+        ])
+    else:
+        raise ValueError(f"Unsupported wheel_order: {wheel_order}")
     # Véc-tơ cơ sở không gian rỗng (Null-space generator) của G: G @ v_null = 0
+    # Cả hai thứ tự [FL, FR, RR, RL] và [FL, FR, RL, RR] đều có hàng trước (+), hàng sau (-)
     v_null = np.array([1.0, 1.0, -1.0, -1.0])
 
     W_cmd = np.asarray(W_cmd, dtype=np.float64)

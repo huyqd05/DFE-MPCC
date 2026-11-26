@@ -41,13 +41,13 @@ from scipy.interpolate import CubicSpline
 from robot_model_amr_casadi import (
     build_amr_symbolic_model,
     PHI_MAX_X, PHI_MAX_Y,
-    TANK_A, TANK_B,
+    TANK_A, TANK_B, H_LIQUID,
     K_SLOSH_0_X, K_SLOSH_0_Y,
     OMEGA_MAX,
     L_X, L_Y, L_SUM, ROBOT_RADIUS,
-    M_TOTAL, IZ_BASE, g,
-    m_0x, m_1x, lx, omega_x,
-    m_0y, m_1y, ly, omega_y
+    M_TOTAL, IZ_BASE, g, ZETA_SLOSH,
+    m_0x, m_1x, lx, omega_x, hd_x,
+    m_0y, m_1y, ly, omega_y, hd_y
 )
 from zonotope_wrench_set import compute_zonotope_facet_matrices
 from mecanum_traction_dynamics import Z_COM, Z_SLOSH, Z_SLOSH_X, Z_SLOSH_Y
@@ -59,7 +59,8 @@ FZ_MIN = 3.5        # Ngưỡng tải trọng pháp tuyến tối thiểu chốn
 class DFEMPCCAMRController:
     def __init__(self, N=15, dt=0.05, mu=0.35, solver_type='ipopt',
                  state_con_mode="skip0", mu_plan_scale=0.95, ipopt_max_iter=35,
-                 h_lim_m=0.030, x_bounds=(-2.75, 8.5), y_bounds=(-2.75, 2.75)):
+                 h_lim_m=0.030, a_brake_max=0.65,
+                 x_bounds=(-2.75, 8.5), y_bounds=(-2.75, 2.75)):
         """
         Khởi tạo bộ điều khiển DFE-MPCC tích hợp Miền Zonotope T1 (12 Mặt Biên)
         và Biên Nhám Mặt Đường Ngẫu Nhiên ISO 8608:2016.
@@ -70,6 +71,8 @@ class DFEMPCCAMRController:
             state_con_mode: 'skip0' (U1a - bỏ ràng buộc chỉ phụ thuộc trạng thái ở k=0) hoặc 'full'
             mu_plan_scale: Hệ số biên an toàn ma sát hoạch định T1 (P3 - mặc định 0.95)
             ipopt_max_iter: Giới hạn số vòng lặp IPOPT tối đa (U2 - mặc định 35)
+            h_lim_m: Giới hạn mép thành tự do h_free (m), mặc định 0.030 m
+            a_brake_max: Gia tốc phanh khẩn cấp cực đại đồng bộ với planner (m/s^2)
             x_bounds: Giới hạn tọa độ X của robot (m)
             y_bounds: Giới hạn tọa độ Y của robot (m)
         """
@@ -83,8 +86,8 @@ class DFEMPCCAMRController:
         self.x_bounds = tuple(x_bounds)
         self.y_bounds = tuple(y_bounds)
         # Ngưỡng sóng dùng trong ràng buộc phanh dự phòng T2 (m). Mặc định 30 mm = h_free.
-        # Có thể đặt thấp hơn (vd 18 mm) để ràng buộc sóng thực sự kích hoạt.
         self.h_lim_m = float(h_lim_m)
+        self.a_brake_max = float(a_brake_max)
 
         # Ma trận 12 mặt biên Zonotope T1 trong không gian Wrench 3D: C_zono @ W <= M_reach @ f_bar
         self.C_zono, self.M_reach = compute_zonotope_facet_matrices(L_SUM)
@@ -99,10 +102,24 @@ class DFEMPCCAMRController:
                 with open(calib_file, "r", encoding="utf-8") as f:
                     cdata = json.load(f)
                     self.default_q_eta_m = float(cdata.get("recommended_q_eta_m", 0.00245))
+                    if "q_eta_t2_total_mm" in cdata:
+                        self.default_q_eta_t2_m = float(cdata["q_eta_t2_total_mm"]) / 1000.0
+                    else:
+                        self.default_q_eta_t2_m = self.default_q_eta_m
             except Exception:
                 self.default_q_eta_m = 0.00245
+                self.default_q_eta_t2_m = self.default_q_eta_m
         else:
             self.default_q_eta_m = 0.00245
+            self.default_q_eta_t2_m = self.default_q_eta_m
+
+        # Tiền tính toán ma trận truyền ZOH chính xác cho 2 trục sóng sánh và hệ số Stokes bậc 2
+        self.Phi_sx, self.Gam_sx = self._compute_slosh_zoh_mats(omega_x, +1.0, self.dt)
+        self.Phi_sy, self.Gam_sy = self._compute_slosh_zoh_mats(omega_y, -1.0, self.dt)
+        self._stokes_ax = float((np.pi * TANK_A / 8.0) / np.tanh(np.pi * H_LIQUID / TANK_A))
+        self._stokes_ay = float((np.pi * TANK_B / 8.0) / np.tanh(np.pi * H_LIQUID / TANK_B))
+        self._stokes_ax_q = float(self._stokes_ax + 0.08 * TANK_A)
+        self._stokes_ay_q = float(self._stokes_ay + 0.08 * TANK_B)
         
         self.nx = 12  # [q (3), v (3), a (3), s (1), vs (1), as (1)]
         self.nu = 4   # [j_amr (3), js (1)]
@@ -161,19 +178,23 @@ class DFEMPCCAMRController:
         self.w_slack_obs = 10000.0   # Biến bù phạt Obstacle ECBF
         self.w_slack_trac = 6000.0   # Biến bù phạt Elip ma sát động (Traction Slack)
         
-        # Bộ đệm warm-start (primal + slack + dual)
+        # Bộ đệm warm-start (primal + slack + dual lbx/g)
         self.x_traj_prev = np.zeros((self.nx, self.N + 1))
         self.u_traj_prev = np.zeros((self.nu, self.N))
+        self._phi_traj_prev = np.zeros((4, self.N + 1), dtype=float)
         self._s_slosh_prev = np.zeros((4, self.N))
         self._s_obs_prev = np.zeros((1, self.N))
         self._s_zono_prev = np.zeros((12, self.N))
         self._s_tube_prev = np.zeros((1, self.N))
         self._s_term_prev = np.zeros((1, 1))
         self.x_opt_prev = None
+        self.lam_x_prev = None
         self.lam_g_prev = None
         self._last_iter_count = 0
-        self._nlp_fun = None
+        self._nlp_solver_init = None
+        self._nlp_solver_warm = None
         self._ng = 0
+        self._nvars = 0
 
         self.spline_x = None
         self.spline_y = None
@@ -190,16 +211,47 @@ class DFEMPCCAMRController:
         # Xây dựng bài toán tối ưu
         self._build_solver()
 
+    @staticmethod
+    def _compute_slosh_zoh_mats(omega_val: float, sigma_val: float, dt_val: float):
+        """Tính ma trận ZOH 2x2 chính xác cho dao động con lắc có cản (zeta = ZETA_SLOSH)."""
+        sq = float(np.sqrt(max(1e-9, 1.0 - ZETA_SLOSH ** 2)))
+        wd = float(omega_val * sq)
+        ez = float(np.exp(-ZETA_SLOSH * omega_val * dt_val))
+        cw = float(np.cos(wd * dt_val))
+        sw = float(np.sin(wd * dt_val))
+        z_sq = ZETA_SLOSH / sq
+        phi_m = ez * np.array([
+            [cw + z_sq * sw, sw / wd],
+            [-(omega_val ** 2 / wd) * sw, cw - z_sq * sw],
+        ], dtype=float)
+        gam_v = (float(sigma_val) / g) * np.array([
+            1.0 - ez * (cw + z_sq * sw),
+            (omega_val ** 2 / wd) * ez * sw,
+        ], dtype=float)
+        return phi_m, gam_v
+
+    def propagate_slosh_zoh(self, phi_est, a_body_seq):
+        """Truyền trạng thái sóng [phi_x, dphi_x, phi_y, dphi_y] qua chuỗi gia tốc thân xe hằng từng bước."""
+        st = np.asarray(phi_est, dtype=float).ravel()[:4].copy()
+        sx = st[0:2]
+        sy = st[2:4]
+        for ab in np.asarray(a_body_seq, dtype=float):
+            sx = self.Phi_sx @ sx + self.Gam_sx * float(ab[0])
+            sy = self.Phi_sy @ sy + self.Gam_sy * float(ab[1])
+        return np.array([sx[0], sx[1], sy[0], sy[1]], dtype=float)
+
     def reset_warm_start(self):
         """Đặt lại toàn bộ bộ đệm warm-start primal/slack/dual cho IPOPT."""
         self.x_traj_prev.fill(0.0)
         self.u_traj_prev.fill(0.0)
+        self._phi_traj_prev.fill(0.0)
         self._s_slosh_prev.fill(0.0)
         self._s_obs_prev.fill(0.0)
         self._s_zono_prev.fill(0.0)
         self._s_tube_prev.fill(0.0)
         self._s_term_prev.fill(0.0)
         self.x_opt_prev = None
+        self.lam_x_prev = None
         self.lam_g_prev = None
         self._last_iter_count = 0
 
@@ -302,152 +354,165 @@ class DFEMPCCAMRController:
         return np.array([xr, yr]), np.array([tx, ty]), th_path
 
     def _build_solver(self):
-        """Xây dựng bài toán tối ưu DFE-MPCC qua CasADi Opti."""
-        opti = cs.Opti()
-        
-        # Biến quyết định
-        X = opti.variable(self.nx, self.N + 1)
-        U = opti.variable(self.nu, self.N)
-        s_slosh = opti.variable(4, self.N)
-        s_obs = opti.variable(1, self.N)
-        s_zono = opti.variable(12, self.N)    # Biến bù cho 12 mặt biên Zonotope T1 (Exact L1 slack)
-        s_tube = opti.variable(1, self.N)     # Biến bù trần Ống vận tốc khả thi (Exact L1 slack)
-        
+        """Xây dựng bài toán tối ưu DFE-MPCC qua CasADi SX + cs.nlpsol với cận biến lbx/ubx trực tiếp."""
+        N = self.N
+        nx = self.nx
+        nu = self.nu
+        k_start = 1 if self.state_con_mode == "skip0" else 0
+
+        # Biến quyết định SX
+        X = cs.SX.sym('X', nx, N + 1)
+        U = cs.SX.sym('U', nu, N)
+        Phi_s = cs.SX.sym('Phi_s', 4, N + 1)
+        s_slosh = cs.SX.sym('s_slosh', 4, N)
+        s_obs = cs.SX.sym('s_obs', 1, N)
+        s_zono = cs.SX.sym('s_zono', 12, N)    # Biến bù cho 12 mặt biên Zonotope T1 (Exact L1 slack)
+        s_tube = cs.SX.sym('s_tube', 1, N)     # Biến bù trần Ống vận tốc khả thi (Exact L1 slack)
+        s_term_slosh = cs.SX.sym('s_term_slosh', 1, 1)
+
         # Tham số đầu vào cập nhật trực tuyến
-        P_x0 = opti.parameter(self.nx)
-        P_path_p = opti.parameter(2, self.N)
-        P_path_t = opti.parameter(2, self.N)
-        P_path_sbar = opti.parameter(1, self.N)
-        P_th_path = opti.parameter(1, self.N)
-        P_phi_est = opti.parameter(4)
+        P_x0 = cs.SX.sym('P_x0', nx)
+        P_path_p = cs.SX.sym('P_path_p', 2, N)
+        P_path_t = cs.SX.sym('P_path_t', 2, N)
+        P_path_sbar = cs.SX.sym('P_path_sbar', 1, N)
+        P_th_path = cs.SX.sym('P_th_path', 1, N)
+        P_phi_est = cs.SX.sym('P_phi_est', 4)
         # [ox, oy, oz, r_obs, d_safe, vox, voy]; vox = voy = 0 -> vật cản tĩnh (giống bản cũ)
-        P_obs = opti.parameter(7)
-        P_mu = opti.parameter(1, self.N)       # Hệ số ma sát hoạch định dọc chân trời dự báo
-        P_q_eta = opti.parameter(1)           # Nguồn lượng tử Conformal an toàn q_eta (m) cho ràng buộc T2
-        P_dfz_iso = opti.parameter(4)         # Biến thiên tải pháp tuyến 4 bánh do mặt đường ISO 8608 (N)
-        P_v_ub = opti.parameter(1, self.N)    # Trần Ống vận tốc khả thi bậc 3 (m/s) dọc chân trời dự báo
-        P_v_lb = opti.parameter(1, self.N)    # Sàn Ống vận tốc khả thi bậc 3 (m/s)
-        
-        # Điều kiện đầu
-        opti.subject_to(X[:, 0] == P_x0)
-        
+        P_obs = cs.SX.sym('P_obs', 7)
+        P_mu = cs.SX.sym('P_mu', 1, N)       # Hệ số ma sát hoạch định dọc chân trời dự báo
+        P_q_eta = cs.SX.sym('P_q_eta', 1)    # Nguồn lượng tử Conformal an toàn q_eta (m) cho ràng buộc T2
+        P_dfz_iso = cs.SX.sym('P_dfz_iso', 4) # Biến thiên tải pháp tuyến 4 bánh do mặt đường ISO 8608 (N)
+        P_v_ub = cs.SX.sym('P_v_ub', 1, N)   # Trần Ống vận tốc khả thi bậc 3 (m/s) dọc chân trời dự báo
+        P_v_lb = cs.SX.sym('P_v_lb', 1, N)   # Sàn Ống vận tốc khả thi bậc 3 (m/s)
+
+        # Cận hộp trực tiếp trên biến quyết định (giảm kích thước ma trận KKT của IPOPT)
+        lbX = np.full((nx, N + 1), -np.inf, dtype=float)
+        ubX = np.full((nx, N + 1), np.inf, dtype=float)
+        for k in range(k_start, N):
+            lbX[0, k], ubX[0, k] = self.x_bounds[0], self.x_bounds[1]
+            lbX[1, k], ubX[1, k] = self.y_bounds[0], self.y_bounds[1]
+            lbX[9, k], ubX[9, k] = 0.0, 30.0
+            lbX[5, k], ubX[5, k] = -1.2, 1.2
+            lbX[6:8, k], ubX[6:8, k] = -1.2, 1.2
+            lbX[8, k], ubX[8, k] = -2.5, 2.5
+            lbX[11, k], ubX[11, k] = -1.2, 1.2
+
+        lbU = np.zeros((nu, N), dtype=float)
+        ubU = np.zeros((nu, N), dtype=float)
+        lbU[0:2, :], ubU[0:2, :] = -4.0, 4.0
+        lbU[2, :], ubU[2, :] = -6.0, 6.0
+        lbU[3, :], ubU[3, :] = -8.0, 8.0
+
+        # Đưa bù P_q_eta cho ECBF ra ngoài vòng lặp (P_q_eta hằng dọc chân trời)
+        eta_ecbf_lim_x = 0.5 * TANK_A * PHI_MAX_X
+        eta_ecbf_lim_y = 0.5 * TANK_B * PHI_MAX_Y
+        excess_q_x = cs.fmax(0.0, eta_ecbf_lim_x + P_q_eta - self.h_lim_m)
+        excess_q_y = cs.fmax(0.0, eta_ecbf_lim_y + P_q_eta - self.h_lim_m)
+        dtheta_margin_x = cs.atan((2.0 * excess_q_x) / TANK_A)
+        dtheta_margin_y = cs.atan((2.0 * excess_q_y) / TANK_B)
+        q_eta_b3_margin = cs.vertcat(
+            K_SLOSH_0_X * dtheta_margin_x,
+            K_SLOSH_0_X * dtheta_margin_x,
+            K_SLOSH_0_Y * dtheta_margin_y,
+            K_SLOSH_0_Y * dtheta_margin_y,
+        )
+
+        g_list, lbg_list, ubg_list = [], [], []
+        # Điều kiện đầu X[:, 0] == P_x0 và Phi_s[:, 0] == P_phi_est
+        g_list.append(X[:, 0] - P_x0)
+        lbg_list.append(np.zeros(nx, dtype=float))
+        ubg_list.append(np.zeros(nx, dtype=float))
+        g_list.append(Phi_s[:, 0] - P_phi_est)
+        lbg_list.append(np.zeros(4, dtype=float))
+        ubg_list.append(np.zeros(4, dtype=float))
+
         cost = 0.0
-        for k in range(self.N):
-            # Biến bù không âm
-            opti.subject_to(s_slosh[:, k] >= 0)
-            opti.subject_to(s_obs[0, k] >= 0)
-            opti.subject_to(s_zono[:, k] >= 0)
-            opti.subject_to(s_tube[0, k] >= 0)
-            
+        inv_sqrt2 = 1.0 / np.sqrt(2.0)
+        phi_x_k = P_phi_est[0]
+        dphi_x_k = P_phi_est[1]
+        phi_y_k = P_phi_est[2]
+        dphi_y_k = P_phi_est[3]
+        cos_phix = cs.cos(phi_x_k)
+        cos_phiy = cs.cos(phi_y_k)
+        M_grav_pend_x = m_1x * g * lx * cs.sin(phi_x_k)
+        M_grav_pend_y = -m_1y * g * ly * cs.sin(phi_y_k)
+
+        for k in range(N):
             # Động học LTI chính xác ZOH
             x_k = X[:, k]
             u_k = U[:, k]
             x_next = X[:, k + 1]
-            opti.subject_to(x_next == self.Ad_dm @ x_k + self.Bd_dm @ u_k)
-            
+            g_list.append(x_next - (self.Ad_dm @ x_k + self.Bd_dm @ u_k))
+            lbg_list.append(np.zeros(nx, dtype=float))
+            ubg_list.append(np.zeros(nx, dtype=float))
+
             q_k = x_k[0:3]
             v_k = x_k[3:6]
             a_k = x_k[6:9]
             s_k = x_k[9]
             vs_k = x_k[10]
-            as_k = x_k[11]
-            
             u_amr = u_k[0:3]
-            js_k = u_k[3]
-            
-            # 1a. Ràng buộc đầu vào điều khiển (luôn áp dụng cho mọi k = 0..N-1)
-            opti.subject_to(opti.bounded(-4.0, u_amr[0:2], 4.0))
-            opti.subject_to(opti.bounded(-6.0, u_amr[2], 6.0))
-            opti.subject_to(opti.bounded(-8.0, js_k, 8.0))
-            
-            # Cải tiến U1a (skip0): Loại bỏ các ràng buộc chỉ phụ thuộc trạng thái tại k=0
-            # (vì X[:, 0] == P_x0 đã cố định hằng số, loại bỏ 27 ràng buộc dư thừa giúp tránh Restoration_Failed)
-            if k >= 1 or self.state_con_mode != "skip0":
-                # 1b. Ràng buộc trạng thái cơ bản
-                opti.subject_to(opti.bounded(self.x_bounds[0], q_k[0], self.x_bounds[1]))
-                opti.subject_to(opti.bounded(self.y_bounds[0], q_k[1], self.y_bounds[1]))
-                opti.subject_to(opti.bounded(0.0, s_k, 30.0))
-                opti.subject_to(opti.bounded(-1.2, v_k[2], 1.2))
-                opti.subject_to(opti.bounded(-1.2, a_k[0:2], 1.2))
-                opti.subject_to(opti.bounded(-2.5, a_k[2], 2.5))
-                opti.subject_to(opti.bounded(-1.2, as_k, 1.2))
 
-                # RÀNG BUỘC ỐNG VẬN TỐC KHẢ THI BẬC 3 (PT 18 Mục 2.6):
-                # 1. Tốc độ tiến trình bám sát ống: v_lb(s_k) <= dot_s_k <= v_ub(s_k) + s_tube,k
+            th_k = q_k[2]
+            c_th = cs.cos(th_k)
+            s_th = cs.sin(th_k)
+            a_bx = c_th * a_k[0] + s_th * a_k[1]
+            a_by = -s_th * a_k[0] + c_th * a_k[1]
+
+            # Cải tiến U1a (skip0): Loại bỏ các ràng buộc chỉ phụ thuộc trạng thái tại k=0
+            if k >= 1 or self.state_con_mode != "skip0":
+                # 1. RÀNG BUỘC ỐNG VẬN TỐC KHẢ THI BẬC 3 (PT 18 Mục 2.6)
                 v_ub_k = P_v_ub[0, k]
                 v_lb_k = P_v_lb[0, k]
-                opti.subject_to(vs_k >= v_lb_k)
-                opti.subject_to(vs_k <= v_ub_k + s_tube[0, k])
+                g_list.append(vs_k - v_lb_k + s_tube[0, k])
+                lbg_list.append(np.array([0.0]))
+                ubg_list.append(np.array([np.inf]))
+                g_list.append(vs_k - v_ub_k - s_tube[0, k])
+                lbg_list.append(np.array([-np.inf]))
+                ubg_list.append(np.array([0.0]))
+                g_list.append(v_k[0]**2 + v_k[1]**2 - (v_ub_k + s_tube[0, k])**2)
+                lbg_list.append(np.array([-np.inf]))
+                ubg_list.append(np.array([0.0]))
 
-                # 2. Vận tốc hình học thực tế không vượt quá trần ống: ||[v_x, v_y]||_2 <= v_ub(s_k) + s_tube,k
-                opti.subject_to(v_k[0]**2 + v_k[1]**2 <= (v_ub_k + s_tube[0, k])**2)
-                
                 # 2. Ràng buộc vận tốc bánh xe Mecanum phi tuyến
                 w_wheels = self.funcs['mecanum_wheels'](q_k, v_k)
-                opti.subject_to(opti.bounded(-OMEGA_MAX, w_wheels, OMEGA_MAX))
-                
-                # 3. RÀNG BUỘC ĐỘNG LỰC HỌC TẢI PHÁP TUYẾN & ELIP MA SÁT ĐỘNG (DFE) + ISO 8608
-                th_k = q_k[2]
-                c_th = cs.cos(th_k)
-                s_th = cs.sin(th_k)
-                
-                # Gia tốc thân xe trong Body Frame
-                a_bx = c_th * a_k[0] + s_th * a_k[1]
-                a_by = -s_th * a_k[0] + c_th * a_k[1]
-                
-                # Lực phản kháng dao động sóng sánh thuần túy FSI (Convective Slosh Residual)
-                phi_x_k = P_phi_est[0]
-                phi_y_k = P_phi_est[2]
-                ddphi_x_k = -omega_x**2 * phi_x_k + (1.0 / lx) * a_bx
-                ddphi_y_k = -omega_y**2 * phi_y_k - (1.0 / ly) * a_by
-                a_rel_pend_x = -lx * ddphi_x_k * cs.cos(phi_x_k)
-                a_rel_pend_y =  ly * ddphi_y_k * cs.cos(phi_y_k)
+                g_list.append(w_wheels)
+                lbg_list.append(np.full(4, -OMEGA_MAX))
+                ubg_list.append(np.full(4, OMEGA_MAX))
 
-                # Lực sóng sánh dư tác động lên bệ xe: F_slosh = -m_1 * a_rel
+                # 3. RÀNG BUỘC ĐỘNG LỰC HỌC TẢI PHÁP TUYẾN & ELIP MA SÁT ĐỘNG (DFE) + ISO 8608
+                # Lực phản kháng dao động sóng sánh thuần túy FSI (Convective Slosh Residual)
+                # Khớp quy ước dấu robot_model_amr_casadi.py & mecanum_traction_dynamics.py
+                ddphi_x_k = -omega_x**2 * phi_x_k - hd_x * dphi_x_k + (1.0 / lx) * a_bx
+                ddphi_y_k = -omega_y**2 * phi_y_k - hd_y * dphi_y_k - (1.0 / ly) * a_by
+                a_rel_pend_x = -lx * ddphi_x_k * cos_phix
+                a_rel_pend_y =  ly * ddphi_y_k * cos_phiy
                 F_slosh_bx = -m_1x * a_rel_pend_x
                 F_slosh_by = -m_1y * a_rel_pend_y
 
-                # Mô-men lật tổng hợp quanh điểm tiếp xúc sàn (M_total đã gồm toàn bộ 100% nước):
-                M_pitch = M_TOTAL * a_bx * Z_COM - F_slosh_bx * Z_SLOSH_X
-                M_roll  = M_TOTAL * a_by * Z_COM - F_slosh_by * Z_SLOSH_Y
-                
-                # Chuyển dịch tải trọng pháp tuyến lên 4 bánh xe + Nhiễu mặt đường ngẫu nhiên ISO 8608
+                # Mô-men lật tổng hợp quanh điểm tiếp xúc sàn (gồm mô-men trọng lực con lắc lệch góc)
+                M_pitch = M_TOTAL * a_bx * Z_COM - F_slosh_bx * Z_SLOSH_X + M_grav_pend_x
+                M_roll  = M_TOTAL * a_by * Z_COM - F_slosh_by * Z_SLOSH_Y + M_grav_pend_y
                 dFz_pitch = M_pitch / (4.0 * L_X)
                 dFz_roll  = M_roll  / (4.0 * L_Y)
-                
+
                 Fz_1 = FZ_STATIC - dFz_pitch - dFz_roll + P_dfz_iso[0]  # FL
                 Fz_2 = FZ_STATIC - dFz_pitch + dFz_roll + P_dfz_iso[1]  # FR
                 Fz_3 = FZ_STATIC + dFz_pitch + dFz_roll + P_dfz_iso[2]  # RR
                 Fz_4 = FZ_STATIC + dFz_pitch - dFz_roll + P_dfz_iso[3]  # RL
-                
-                # 3.1 Ràng buộc chống nhấc bánh (Anti-tipping: Fz >= Fz_min)
-                opti.subject_to(Fz_1 >= FZ_MIN)
-                opti.subject_to(Fz_2 >= FZ_MIN)
-                opti.subject_to(Fz_3 >= FZ_MIN)
-                opti.subject_to(Fz_4 >= FZ_MIN)
-                
-                # 3.2 Lực bệ xe yêu cầu trong Body Frame (M_TOTAL * a_b - F_slosh)
-                F_cmd_bx = M_TOTAL * a_bx - F_slosh_bx
-                F_cmd_by = M_TOTAL * a_by - F_slosh_by
-                Tau_cmd_bz = IZ_BASE * a_k[2]
-                
-                # 3.3 Vector Wrench yêu cầu trên thân xe: W_cmd = [F_bx, F_by, Tau_bz]^T
-                W_cmd = cs.vertcat(F_cmd_bx, F_cmd_by, Tau_cmd_bz)
+                Fz_vec = cs.vertcat(Fz_1, Fz_2, Fz_3, Fz_4)
+                g_list.append(Fz_vec)
+                lbg_list.append(np.full(4, FZ_MIN))
+                ubg_list.append(np.full(4, np.inf))
 
-                # 3.4 Giới hạn bám ma sát 4 bánh xe Mecanum với biên hoạch định dọc chân trời P_mu[0, k]:
-                # ||F_ground,i|| = sqrt(2)*|f_i| <= mu_plan_k * Fz_i
-                inv_sqrt2 = 1.0 / np.sqrt(2.0)
-                mu_plan = P_mu[0, k]
-                f_bar_1 = (mu_plan * Fz_1) * inv_sqrt2
-                f_bar_2 = (mu_plan * Fz_2) * inv_sqrt2
-                f_bar_3 = (mu_plan * Fz_3) * inv_sqrt2
-                f_bar_4 = (mu_plan * Fz_4) * inv_sqrt2
-                f_bar_vec = cs.vertcat(f_bar_1, f_bar_2, f_bar_3, f_bar_4)
-
-                # 3.5 RÀNG BUỘC MIỀN ZONOTOPE T1 (12 MẶT BIÊN TRONG KHÔNG GIAN WRENCH 3D):
+                # Lực bệ xe yêu cầu & Zonotope T1 (12 mặt biên)
+                W_cmd = cs.vertcat(M_TOTAL * a_bx - F_slosh_bx, M_TOTAL * a_by - F_slosh_by, IZ_BASE * a_k[2])
+                f_bar_vec = (P_mu[0, k] * Fz_vec) * inv_sqrt2
                 d_zono = self.M_reach_dm @ f_bar_vec
-                opti.subject_to(self.C_zono_dm @ W_cmd <= d_zono + s_zono[:, k])
-            
+                g_list.append(self.C_zono_dm @ W_cmd - d_zono - s_zono[:, k])
+                lbg_list.append(np.full(12, -np.inf))
+                ubg_list.append(np.zeros(12))
+
             # 4. Sai số hình học MPCC
             p_bar = P_path_p[:, k]
             t_bar = P_path_t[:, k]
@@ -457,37 +522,23 @@ class DFEMPCCAMRController:
             e_k = p_rob - (p_bar + t_bar * (s_k - s_bar))
             eps_c = n_bar[0] * e_k[0] + n_bar[1] * e_k[1]
             eps_l = t_bar[0] * e_k[0] + t_bar[1] * e_k[1]
-            
-            # 5. Slosh-ECBF bậc 3 (Soft constraint): sử dụng ngưỡng bảo toàn nội bộ PHI_MAX_X/Y
-            # (~18.75 mm dọc, ~9.00 mm ngang đã có biên dự trữ dưới trần tràn 30 mm) khi P_phi_est giữ cố định trên chân trời.
-            # Chỉ thu hẹp thêm góc ECBF nếu tổng ngưỡng ECBF + P_q_eta vượt quá trần tự do thực h_free = self.h_lim_m;
-            # trong khi toàn bộ lượng tử bảo toàn P_q_eta vẫn được áp dụng đầy đủ ở ràng buộc đích T2 (eta_peak + P_q_eta <= h_free).
+
+            # 5. Slosh-ECBF bậc 3 (Soft constraint)
             b3_slosh = self.funcs['slosh_cbf'](q_k, v_k, a_k, u_amr, P_phi_est)
-            eta_ecbf_lim_x = 0.5 * TANK_A * PHI_MAX_X
-            eta_ecbf_lim_y = 0.5 * TANK_B * PHI_MAX_Y
-            excess_q_x = cs.fmax(0.0, eta_ecbf_lim_x + P_q_eta - self.h_lim_m)
-            excess_q_y = cs.fmax(0.0, eta_ecbf_lim_y + P_q_eta - self.h_lim_m)
-            dtheta_margin_x = cs.atan((2.0 * excess_q_x) / TANK_A)
-            dtheta_margin_y = cs.atan((2.0 * excess_q_y) / TANK_B)
-            q_eta_b3_margin = cs.vertcat(
-                K_SLOSH_0_X * dtheta_margin_x,
-                K_SLOSH_0_X * dtheta_margin_x,
-                K_SLOSH_0_Y * dtheta_margin_y,
-                K_SLOSH_0_Y * dtheta_margin_y
-            )
-            opti.subject_to(b3_slosh - q_eta_b3_margin + s_slosh[:, k] >= 0)
-            
+            g_list.append(b3_slosh - q_eta_b3_margin + s_slosh[:, k])
+            lbg_list.append(np.zeros(4))
+            ubg_list.append(np.full(4, np.inf))
+
             # 6. Obstacle-ECBF bậc 3 (Soft constraint)
-            # Vật cản di chuyển vận tốc hằng trên tầm dự báo: o(t_k) = o_0 + v_o * t_k.
-            # Với h = |p - o|^2 - r^2, các đạo hàm dùng vận tốc tương đối (v - v_o).
-            # Khi v_o = 0 biểu thức trùng với ECBF vật cản tĩnh trước đây.
             t_k = k * self.dt
             obs_xy_k = P_obs[0:2] + P_obs[5:7] * t_k
             P_obs_k = cs.vertcat(obs_xy_k, P_obs[2:5])
             v_rel_k = cs.vertcat(v_k[0] - P_obs[5], v_k[1] - P_obs[6], v_k[2])
             b3_obs = self.funcs['obs_cbf'](q_k, v_rel_k, a_k, u_amr, P_obs_k)
-            opti.subject_to(b3_obs + s_obs[0, k] >= 0)
-            
+            g_list.append(b3_obs + s_obs[0, k])
+            lbg_list.append(np.array([0.0]))
+            ubg_list.append(np.array([np.inf]))
+
             # Tích lũy hàm mục tiêu có thứ bậc chính xác (Exact Hierarchical Penalty)
             cost += self.w_contour * (eps_c ** 2)
             cost += self.w_lag * (eps_l ** 2)
@@ -496,41 +547,86 @@ class DFEMPCCAMRController:
             cost += self.w_u * cs.sumsqr(u_k)
             cost += self.w_v * cs.sumsqr(v_k)
             cost += self.w_a * cs.sumsqr(a_k)
-            # Exact L1 Slack Penalties (Kerrigan & Maciejowski 2000)
             cost += self.w_slack_slosh * cs.sum1(s_slosh[:, k])
             cost += self.w_slack_obs * s_obs[0, k]
             cost += self.w_slack_trac * cs.sum1(s_zono[:, k])
             cost += 2000.0 * s_tube[0, k] + 10000.0 * (s_tube[0, k] ** 2)
-            
-        # Chi phí điểm cuối (Terminal Cost)
-        cost += 40.0 * (eps_c ** 2) + 40.0 * (eps_l ** 2) + 20.0 * ((X[2, self.N] - P_th_path[0, self.N - 1]) ** 2) - 6.0 * X[10, self.N]
-        
-        # 7. RÀNG BUỘC PHANH DỰ PHÒNG T2 TẠI BƯỚC CUỐI CHÂN TRỜI (k = N) CÓ BÙ LƯỢNG TỬ q_eta
-        # Năng lượng con lắc dịch tâm phụ thuộc trực tiếp vào vận tốc & gia tốc cuối chân trời X[:, N]
-        a_b_nom = 0.80
-        phi_eq_x = a_b_nom / 9.81
-        v_N_norm_sq = X[3, self.N]**2 + X[4, self.N]**2
-        a_N_norm_sq = X[6, self.N]**2 + X[7, self.N]**2
-        phi_x_N = cs.fabs(P_phi_est[0]) + 0.08 * cs.sqrt(a_N_norm_sq + 1e-4)
-        dphi_x_N = cs.fabs(P_phi_est[1]) + 0.35 * cs.sqrt(v_N_norm_sq + 1e-4)
-        omega_x_val = 13.84
-        phi_peak_brake_x = phi_eq_x + cs.sqrt((phi_x_N - phi_eq_x)**2 + (dphi_x_N / omega_x_val)**2 + 1e-6)
-        eta_peak_N_m = 0.5 * 0.150 * phi_peak_brake_x
-        h_free_m = self.h_lim_m  # mặc định 30 mm
-        s_term_slosh = opti.variable(1)
-        opti.subject_to(s_term_slosh >= 0)
-        opti.subject_to(eta_peak_N_m + P_q_eta <= h_free_m + s_term_slosh)
-        cost += 5000.0 * s_term_slosh
 
-        opti.minimize(cost)
-        
-        # Thiết lập bộ giải IPOPT thời gian thực (adaptive barrier + primal-dual warm-start + to_function)
-        opts_p = {'expand': True, 'print_time': False, 'error_on_fail': False}
-        opts_s = {
+            # Ràng buộc truyền trạng thái sóng ZOH thưa theo khối cho mọi k = 0..N-1
+            phi_x_next = self.Phi_sx[0, 0] * Phi_s[0, k] + self.Phi_sx[0, 1] * Phi_s[1, k] + self.Gam_sx[0] * a_bx
+            dphi_x_next = self.Phi_sx[1, 0] * Phi_s[0, k] + self.Phi_sx[1, 1] * Phi_s[1, k] + self.Gam_sx[1] * a_bx
+            phi_y_next = self.Phi_sy[0, 0] * Phi_s[2, k] + self.Phi_sy[0, 1] * Phi_s[3, k] + self.Gam_sy[0] * a_by
+            dphi_y_next = self.Phi_sy[1, 0] * Phi_s[2, k] + self.Phi_sy[1, 1] * Phi_s[3, k] + self.Gam_sy[1] * a_by
+            g_list.append(Phi_s[:, k + 1] - cs.vertcat(phi_x_next, dphi_x_next, phi_y_next, dphi_y_next))
+            lbg_list.append(np.zeros(4, dtype=float))
+            ubg_list.append(np.zeros(4, dtype=float))
+
+        # Chi phí điểm cuối (Terminal Cost)
+        cost += 40.0 * (eps_c ** 2) + 40.0 * (eps_l ** 2) + 20.0 * ((X[2, N] - P_th_path[0, N - 1]) ** 2) - 6.0 * X[10, N]
+
+        # 7. TẬP AN TOÀN CUỐI BẤT BIẾN PHANH DỪNG T2 TẠI k = N (LIFTED SPARSE ZOH + STOKES BẬC 2, 2 TRỤC X & Y)
+        phi_x_N = Phi_s[0, N]
+        dphi_x_N = Phi_s[1, N]
+        phi_y_N = Phi_s[2, N]
+        dphi_y_N = Phi_s[3, N]
+        c_thN = cs.cos(X[2, N])
+        s_thN = cs.sin(X[2, N])
+        v_bx_N = c_thN * X[3, N] + s_thN * X[4, N]
+        v_by_N = -s_thN * X[3, N] + c_thN * X[4, N]
+        v_N_norm = cs.sqrt(v_bx_N**2 + v_by_N**2 + 0.08**2)
+        a_brk_x_N = -self.a_brake_max * (v_bx_N / v_N_norm)
+        a_brk_y_N = -self.a_brake_max * (v_by_N / v_N_norm)
+        phi_eq_x_N = a_brk_x_N / g
+        phi_eq_y_N = -a_brk_y_N / g
+        phi_peak_brake_x = cs.sqrt(phi_eq_x_N**2 + 1e-6) + cs.sqrt((phi_x_N - phi_eq_x_N)**2 + (dphi_x_N / omega_x)**2 + 1e-6)
+        phi_peak_brake_y = cs.sqrt(phi_eq_y_N**2 + 1e-6) + cs.sqrt((phi_y_N - phi_eq_y_N)**2 + (dphi_y_N / omega_y)**2 + 1e-6)
+        eta_peak_x_m = 0.5 * TANK_A * phi_peak_brake_x + self._stokes_ax_q * (phi_peak_brake_x ** 2)
+        eta_peak_y_m = 0.5 * TANK_B * phi_peak_brake_y + self._stokes_ay_q * (phi_peak_brake_y ** 2)
+        h_free_m = self.h_lim_m
+        g_list.append(eta_peak_x_m + 0.35 * eta_peak_y_m + P_q_eta - h_free_m - s_term_slosh[0, 0])
+        lbg_list.append(np.array([-np.inf]))
+        ubg_list.append(np.array([0.0]))
+        g_list.append(eta_peak_y_m + 0.35 * eta_peak_x_m + P_q_eta - h_free_m - s_term_slosh[0, 0])
+        lbg_list.append(np.array([-np.inf]))
+        ubg_list.append(np.array([0.0]))
+        cost += 8000.0 * s_term_slosh[0, 0] + 40000.0 * (s_term_slosh[0, 0] ** 2)
+
+        w_vec = cs.vertcat(
+            cs.vec(X), cs.vec(U), cs.vec(Phi_s),
+            cs.vec(s_slosh), cs.vec(s_obs), cs.vec(s_zono), cs.vec(s_tube), s_term_slosh
+        )
+        p_vec = cs.vertcat(
+            P_x0, cs.vec(P_path_p), cs.vec(P_path_t), cs.vec(P_path_sbar), cs.vec(P_th_path),
+            P_phi_est, P_obs, cs.vec(P_mu), P_q_eta, P_dfz_iso, cs.vec(P_v_ub), cs.vec(P_v_lb)
+        )
+        g_vec = cs.vertcat(*g_list)
+        self._lbg = np.concatenate(lbg_list)
+        self._ubg = np.concatenate(ubg_list)
+        self._n_slacks = 4 * N + N + 12 * N + N + 1
+        lbPhi = np.full((4, N + 1), -np.inf, dtype=float)
+        ubPhi = np.full((4, N + 1), np.inf, dtype=float)
+        self._lbx = np.concatenate([
+            lbX.ravel(order='F'), lbU.ravel(order='F'), lbPhi.ravel(order='F'),
+            np.zeros(self._n_slacks, dtype=float),
+        ])
+        self._ubx = np.concatenate([
+            ubX.ravel(order='F'), ubU.ravel(order='F'), ubPhi.ravel(order='F'),
+            np.full(self._n_slacks, np.inf, dtype=float),
+        ])
+        self._nvars = int(w_vec.shape[0])
+        self._ng = int(g_vec.shape[0])
+        self._nX = nx * (N + 1)
+        self._nU = nu * N
+        self._nPhi = 4 * (N + 1)
+
+        nlp_dict = {'x': w_vec, 'p': p_vec, 'f': cost, 'g': g_vec}
+        ipopt_warm = {
             'max_iter': self.ipopt_max_iter,
             'print_level': 0,
             'sb': 'yes',
             'tol': 1e-2,
+            'constr_viol_tol': 1e-4,
+            'compl_inf_tol': 5e-4,
             'acceptable_tol': 5e-2,
             'acceptable_iter': 2,
             'mu_strategy': 'adaptive',
@@ -539,56 +635,33 @@ class DFEMPCCAMRController:
             'warm_start_slack_bound_push': 5e-6,
             'warm_start_mult_bound_push': 5e-6,
         }
-        opti.solver('ipopt', opts_p, opts_s)
-        self._nlp_fun = opti.to_function(
-            'dfe_mpcc_nlp',
-            [
-                P_x0, P_path_p, P_path_t, P_path_sbar, P_th_path, P_phi_est, P_obs,
-                P_mu, P_q_eta, P_dfz_iso, P_v_ub, P_v_lb,
-                X, U, s_slosh, s_obs, s_zono, s_tube, s_term_slosh, opti.lam_g,
-            ],
-            [X, U, s_slosh, s_obs, s_zono, s_tube, s_term_slosh, opti.lam_g],
+        ipopt_init = dict(ipopt_warm)
+        ipopt_init['warm_start_init_point'] = 'no'
+        ipopt_init['max_iter'] = max(self.ipopt_max_iter, 25)
+        self._nlp_solver_warm = cs.nlpsol(
+            'dfe_mpcc_warm', 'ipopt', nlp_dict, {'print_time': False, 'error_on_fail': False, 'ipopt': ipopt_warm}
         )
-        self._ng = int(opti.ng)
-        
-        self.opti = opti
-        self.X = X
-        self.U = U
-        self.s_slosh = s_slosh
-        self.s_obs = s_obs
-        self.s_zono = s_zono
-        self.s_tube = s_tube
-        self.s_term_slosh = s_term_slosh
-        self.P_x0 = P_x0
-        self.P_path_p = P_path_p
-        self.P_path_t = P_path_t
-        self.P_path_sbar = P_path_sbar
-        self.P_th_path = P_th_path
-        self.P_phi_est = P_phi_est
-        self.P_obs = P_obs
-        self.P_mu = P_mu
-        self.P_q_eta = P_q_eta
-        self.P_dfz_iso = P_dfz_iso
-        self.P_v_ub = P_v_ub
-        self.P_v_lb = P_v_lb
+        self._nlp_solver_init = cs.nlpsol(
+            'dfe_mpcc_init', 'ipopt', nlp_dict, {'print_time': False, 'error_on_fail': False, 'ipopt': ipopt_init}
+        )
 
     def solve_step(self, x_current, phi_est, obs_info=None, mu_floor=None, q_eta=None, dfz_iso=None, v_ub_horizon=None, v_lb_horizon=None, mu_horizon=None):
         """
         Thực thi giải một chu kỳ DFE-MPCC (20 Hz) nhúng Ống vận tốc khả thi bậc 3 (H124)
         và biên mặt đường ngẫu nhiên ISO 8608.
         """
-        t_start = time.time()
+        t_start = time.perf_counter()
         if obs_info is None:
             obs_info = np.array([10.0, 10.0, 0.5, 0.2, 0.1])
         obs_info = np.asarray(obs_info, dtype=float).ravel()
         if obs_info.size < 7:
             obs_info = np.concatenate([obs_info, np.zeros(7 - obs_info.size)])
-        q_eta_apply = float(q_eta if q_eta is not None else self.default_q_eta_m)
+        q_eta_apply = float(q_eta if q_eta is not None else self.default_q_eta_t2_m)
         if dfz_iso is None:
             dfz_iso_vec = np.zeros(4)
         else:
             dfz_iso_vec = np.asarray(dfz_iso, dtype=float).reshape(4)
-            
+
         # 1. Trích xuất tham số tham chiếu dọc chuỗi s dự báo (vector hóa)
         s_cur = float(np.clip(x_current[9], 0.0, self.path_length))
         vs_cur = float(np.clip(x_current[10], 0.05, 0.75))
@@ -642,78 +715,144 @@ class DFEMPCCAMRController:
             v_ub_vec = np.full((1, self.N), 0.60)
             v_lb_vec = np.zeros((1, self.N))
 
-        # 3. Warm start primal + slack + dual dịch chuyển từ chu kỳ trước
-        if np.any(self.x_traj_prev != 0):
-            x_init = np.zeros((self.nx, self.N + 1))
-            x_init[:, :-1] = self.x_traj_prev[:, 1:]
-            x_init[:, -1] = self.x_traj_prev[:, -1]
-            u_init = np.zeros((self.nu, self.N))
-            u_init[:, :-1] = self.u_traj_prev[:, 1:]
-            u_init[:, -1] = self.u_traj_prev[:, -1]
-        else:
-            x_init = np.zeros((self.nx, self.N + 1))
-            u_init = np.zeros((self.nu, self.N))
-        lam_init = self.lam_g_prev if self.lam_g_prev is not None else np.zeros(self._ng, dtype=float)
-
-        # 4. Giải tối ưu NLP qua CasADi Function đã biên dịch (to_function)
-        Xo, Uo, s_sl_o, s_ob_o, s_zo_o, s_tu_o, s_te_o, lam_o = self._nlp_fun(
-            x_current,
-            path_p,
-            path_t,
-            path_sbar,
-            th_path,
-            phi_est,
-            obs_info,
-            mu_plan_vec,
-            q_eta_apply,
-            dfz_iso_vec,
-            v_ub_vec,
-            v_lb_vec,
-            x_init,
-            u_init,
-            self._s_slosh_prev,
-            self._s_obs_prev,
-            self._s_zono_prev,
-            self._s_tube_prev,
-            self._s_term_prev,
-            lam_init,
+        # Kẹp sàn ống v_lb theo gia tốc khả thi trong nón ma sát từ vận tốc tiến độ hiện tại
+        # để sàn tiến độ (liveness) không bao giờ ép bộ giải vi phạm Zonotope ma sát (safety).
+        vs_now_lb = float(np.clip(x_current[10], 0.0, 0.75))
+        a_lb_ramp = np.minimum(0.55, 0.45 * mu_plan_vec * g)
+        dv_lb_cum = np.concatenate(
+            [np.zeros((1, 1), dtype=float), np.cumsum(a_lb_ramp[:, :-1] * self.dt, axis=1)],
+            axis=1,
         )
+        v_lb_vec = np.minimum(v_lb_vec, vs_now_lb + dv_lb_cum)
 
-        stats = self._nlp_fun.stats()
-        is_ok = bool(stats.get('success', False))
+        p_val = np.concatenate([
+            np.asarray(x_current, dtype=float).ravel(),
+            path_p.ravel(order='F'),
+            path_t.ravel(order='F'),
+            path_sbar.ravel(order='F'),
+            th_path.ravel(order='F'),
+            np.asarray(phi_est, dtype=float).ravel(),
+            obs_info[:7],
+            mu_plan_vec.ravel(order='F'),
+            np.array([q_eta_apply], dtype=float),
+            dfz_iso_vec,
+            v_ub_vec.ravel(order='F'),
+            v_lb_vec.ravel(order='F'),
+        ])
+
+        # 3. Khởi tạo lạnh rollout ở bước đầu, hoặc warm-start dịch chuyển khi đủ thông tin đối ngẫu
+        phi_vec = np.asarray(phi_est, dtype=float).ravel()
+        has_primal_prev = bool(np.any(self.x_traj_prev != 0))
+        has_warm_dual = (
+            has_primal_prev
+            and (self.x_opt_prev is not None)
+            and (self.lam_x_prev is not None)
+            and (self.lam_g_prev is not None)
+        )
+        if not has_primal_prev:
+            x_init = np.zeros((self.nx, self.N + 1), dtype=float)
+            x_init[:, 0] = np.asarray(x_current, dtype=float).ravel()
+            for k in range(self.N):
+                x_init[:, k + 1] = self.Ad @ x_init[:, k]
+            u_init = np.zeros((self.nu, self.N), dtype=float)
+        else:
+            x_init = np.zeros((self.nx, self.N + 1), dtype=float)
+            x_init[:, :-1] = self.x_traj_prev[:, 1:]
+            x_init[:, -1] = self.Ad @ x_init[:, -2]
+            u_init = np.zeros((self.nu, self.N), dtype=float)
+            u_init[:, :-1] = self.u_traj_prev[:, 1:]
+
+        phi_init = np.zeros((4, self.N + 1), dtype=float)
+        if has_primal_prev and np.any(self._phi_traj_prev != 0):
+            phi_init[:, :-1] = self._phi_traj_prev[:, 1:]
+            th_nm2 = float(x_init[2, -2])
+            c_nm2, s_nm2 = np.cos(th_nm2), np.sin(th_nm2)
+            abx_nm2 = c_nm2 * float(x_init[6, -2]) + s_nm2 * float(x_init[7, -2])
+            aby_nm2 = -s_nm2 * float(x_init[6, -2]) + c_nm2 * float(x_init[7, -2])
+            phi_init[0:2, -1] = self.Phi_sx @ phi_init[0:2, -2] + self.Gam_sx * abx_nm2
+            phi_init[2:4, -1] = self.Phi_sy @ phi_init[2:4, -2] + self.Gam_sy * aby_nm2
+        else:
+            phi_init[:, 0] = phi_vec[:4]
+            for k in range(self.N):
+                phi_init[0:2, k + 1] = self.Phi_sx @ phi_init[0:2, k]
+                phi_init[2:4, k + 1] = self.Phi_sy @ phi_init[2:4, k]
+
+        if has_warm_dual:
+            slack_init = np.concatenate([
+                self._s_slosh_prev.ravel(order='F'),
+                self._s_obs_prev.ravel(order='F'),
+                self._s_zono_prev.ravel(order='F'),
+                self._s_tube_prev.ravel(order='F'),
+                self._s_term_prev.ravel(order='F'),
+            ])
+            w0 = np.concatenate([
+                x_init.ravel(order='F'), u_init.ravel(order='F'), phi_init.ravel(order='F'), slack_init
+            ])
+            res = self._nlp_solver_warm(
+                x0=w0, p=p_val, lbx=self._lbx, ubx=self._ubx, lbg=self._lbg, ubg=self._ubg,
+                lam_x0=self.lam_x_prev, lam_g0=self.lam_g_prev,
+            )
+            stats = self._nlp_solver_warm.stats()
+        else:
+            slack_init = np.full(self._n_slacks, 1e-3, dtype=float)
+            w0 = np.concatenate([
+                x_init.ravel(order='F'), u_init.ravel(order='F'), phi_init.ravel(order='F'), slack_init
+            ])
+            res = self._nlp_solver_init(
+                x0=w0, p=p_val, lbx=self._lbx, ubx=self._ubx, lbg=self._lbg, ubg=self._ubg
+            )
+            stats = self._nlp_solver_init.stats()
+
+        ret_status = str(stats.get('return_status', ''))
+        is_ok = bool(stats.get('success', False)) or (ret_status == 'Solved_To_Acceptable_Level')
         iter_count = int(stats.get('iter_count', -1))
 
-        x_pred = np.asarray(Xo, dtype=float)
-        u_pred = np.asarray(Uo, dtype=float)
-        s_sl_np = np.asarray(s_sl_o, dtype=float).reshape(4, self.N)
-        s_ob_np = np.asarray(s_ob_o, dtype=float).reshape(1, self.N)
-        s_zo_np = np.asarray(s_zo_o, dtype=float).reshape(12, self.N)
-        s_tu_np = np.asarray(s_tu_o, dtype=float).reshape(1, self.N)
-        s_te_np = np.asarray(s_te_o, dtype=float).reshape(1, 1)
-        lam_out = np.asarray(lam_o, dtype=float).ravel()
+        w_sol = np.asarray(res['x'], dtype=float).ravel()
+        nX, nU, nPhi, N = self._nX, self._nU, self._nPhi, self.N
+        o0 = nX + nU + nPhi
+        o1 = o0 + 4 * N
+        o2 = o1 + N
+        o3 = o2 + 12 * N
+        o4 = o3 + N
+
+        x_pred = w_sol[:nX].reshape(self.nx, N + 1, order='F')
+        u_pred = w_sol[nX:nX + nU].reshape(self.nu, N, order='F')
+        phi_pred = w_sol[nX + nU:nX + nU + nPhi].reshape(4, N + 1, order='F')
+        s_sl_np = w_sol[o0:o1].reshape(4, N, order='F')
+        s_ob_np = w_sol[o1:o2].reshape(1, N, order='F')
+        s_zo_np = w_sol[o2:o3].reshape(12, N, order='F')
+        s_tu_np = w_sol[o3:o4].reshape(1, N, order='F')
+        s_te_np = w_sol[o4:o4 + 1].reshape(1, 1)
+        lam_x_out = np.asarray(res['lam_x'], dtype=float).ravel()
+        lam_g_out = np.asarray(res['lam_g'], dtype=float).ravel()
 
         xu_finite = bool(np.all(np.isfinite(x_pred)) and np.all(np.isfinite(u_pred)))
         all_finite = bool(
             xu_finite
+            and np.all(np.isfinite(phi_pred))
             and np.all(np.isfinite(s_sl_np))
             and np.all(np.isfinite(s_ob_np))
             and np.all(np.isfinite(s_zo_np))
             and np.all(np.isfinite(s_tu_np))
             and np.all(np.isfinite(s_te_np))
-            and np.all(np.isfinite(lam_out))
+            and np.all(np.isfinite(lam_x_out))
+            and np.all(np.isfinite(lam_g_out))
         )
         if not all_finite:
             is_ok = False
             if not np.all(np.isfinite(x_pred)):
-                x_pred = np.zeros((self.nx, self.N + 1), dtype=float)
+                x_pred = np.zeros((self.nx, N + 1), dtype=float)
             if not np.all(np.isfinite(u_pred)):
-                u_pred = np.zeros((self.nu, self.N), dtype=float)
-            s_sl_np = np.zeros((4, self.N), dtype=float)
-            s_ob_np = np.zeros((1, self.N), dtype=float)
-            s_zo_np = np.zeros((12, self.N), dtype=float)
-            s_tu_np = np.zeros((1, self.N), dtype=float)
+                u_pred = np.zeros((self.nu, N), dtype=float)
+            if not np.all(np.isfinite(phi_pred)):
+                phi_pred = np.zeros((4, N + 1), dtype=float)
+            s_sl_np = np.zeros((4, N), dtype=float)
+            s_ob_np = np.zeros((1, N), dtype=float)
+            s_zo_np = np.zeros((12, N), dtype=float)
+            s_tu_np = np.zeros((1, N), dtype=float)
             s_te_np = np.zeros((1, 1), dtype=float)
-            lam_out = np.zeros(self._ng, dtype=float)
+            lam_x_out = np.zeros(self._nvars, dtype=float)
+            lam_g_out = np.zeros(self._ng, dtype=float)
 
         u_opt = u_pred[0:3, 0].copy()
         js_opt = float(u_pred[3, 0])
@@ -727,17 +866,18 @@ class DFEMPCCAMRController:
             self._s_zono_prev = s_zo_np
             self._s_tube_prev = s_tu_np
             self._s_term_prev = s_te_np
-            self.lam_g_prev = lam_out
+            self.lam_x_prev = lam_x_out
+            self.lam_g_prev = lam_g_out
             self.x_opt_prev = x_pred
             self.x_traj_prev = x_pred.copy()
             self.u_traj_prev = u_pred.copy()
+            self._phi_traj_prev = phi_pred.copy()
         else:
             status = 'suboptimal_fallback'
-            # Nghiệm fallback của IPOPT có thể vi phạm hộp jerk; kẹp lại để lệnh áp dụng
-            # luôn nằm trong giới hạn |j_xy| <= 4, |j_th| <= 6, |js| <= 8.
             u_opt[0:2] = np.clip(u_opt[0:2], -4.0, 4.0)
             u_opt[2] = float(np.clip(u_opt[2], -6.0, 6.0))
             js_opt = float(np.clip(js_opt, -8.0, 8.0))
+            self.lam_x_prev = None
             self.lam_g_prev = None
             self.x_opt_prev = None
             self._s_slosh_prev.fill(0.0)
@@ -745,13 +885,14 @@ class DFEMPCCAMRController:
             self._s_zono_prev.fill(0.0)
             self._s_tube_prev.fill(0.0)
             self._s_term_prev.fill(0.0)
+            self._phi_traj_prev.fill(0.0)
             if xu_finite:
                 self.x_traj_prev = x_pred.copy()
                 self.u_traj_prev = u_pred.copy()
 
         self._last_iter_count = iter_count
 
-        t_solve_ms = (time.time() - t_start) * 1000.0
+        t_solve_ms = (time.perf_counter() - t_start) * 1000.0
         
         extra_info = {
             'solve_time_ms': t_solve_ms,
@@ -760,7 +901,9 @@ class DFEMPCCAMRController:
             'slack_tube': slack_tube_val,
             'v_ub_preview': v_ub_vec.flatten(),
             'mu_plan_preview': mu_plan_vec.flatten(),
-            'slack_zono_max': slack_zono_val
+            'slack_zono_max': slack_zono_val,
+            'slack_term_slosh': float(s_te_np[0, 0]),
+            'phi_N_pred': phi_pred[:, -1].copy(),
         }
         
         return u_opt, js_opt, x_pred, u_pred, extra_info

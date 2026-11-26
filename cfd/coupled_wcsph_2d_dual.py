@@ -240,6 +240,7 @@ class DualSliceWCSPH:
         delta_psi_rad: float = 0.0,
         t1_window_s: float = 0.150,
         t2_window_s: float = 0.090,
+        t_brake_s: float = None,
     ) -> dict:
         """
         Đánh giá một Checkpoint theo chuẩn Hybrid B+A cửa sổ dài:
@@ -311,7 +312,26 @@ class DualSliceWCSPH:
 
         # 4. Nhánh phanh phản thực tế T2 (Counterfactual Emergency Braking) trên trạng thái đã có sóng T1
         n2_steps = max(1, int(round(t2_window_s / dt)))
-        res_t2 = self.integrate_window(n2_steps, dt, ax=a_brk_x, ay=a_brk_y, ramp_steps=1)
+        if t_brake_s is None or t_brake_s >= t2_window_s:
+            res_t2 = self.integrate_window(n2_steps, dt, ax=a_brk_x, ay=a_brk_y, ramp_steps=1)
+        else:
+            n2_brk = max(1, min(n2_steps, int(round(t_brake_s / dt))))
+            n2_coast = max(0, n2_steps - n2_brk)
+            res_t2_brk = self.integrate_window(n2_brk, dt, ax=a_brk_x, ay=a_brk_y, ramp_steps=1)
+            if n2_coast > 0:
+                res_t2_coast = self.integrate_window(n2_coast, dt, ax=0.0, ay=0.0, ramp_steps=1)
+                res_t2 = dict(res_t2_coast)
+                for peak_key in (
+                    "peak_eta_surf_x_mm", "peak_eta_surf_y_mm",
+                    "peak_eta_wall_x_mm", "peak_eta_wall_y_mm",
+                    "peak_eta_cm_x_mm", "peak_eta_cm_y_mm",
+                    "peak_fx_wall_N", "peak_fy_wall_N",
+                ):
+                    res_t2[peak_key] = max(float(res_t2_brk[peak_key]), float(res_t2_coast[peak_key]))
+                res_t2["window_steps"] = int(n2_steps)
+                res_t2["window_time_ms"] = round(float(n2_steps * dt * 1000.0), 2)
+            else:
+                res_t2 = res_t2_brk
 
         tan_t2_y = max(tan_th_y_final * 0.85, (float(res_t2["peak_eta_surf_y_mm"]) * 1e-3) / max(0.5 * ly, 1e-6))
         tan_t2_x_dir = (float(res_t2["peak_eta_surf_x_mm"]) * 1e-3) / max(0.5 * lx, 1e-6)
@@ -339,4 +359,5 @@ class DualSliceWCSPH:
             "res_t2": res_t2,
             "t1_window_ms": float(n1_steps * dt * 1000.0),
             "t2_window_ms": float(n2_steps * dt * 1000.0),
+            "t_brake_ms": round(float((t_brake_s if t_brake_s is not None else t2_window_s) * 1000.0), 2),
         }

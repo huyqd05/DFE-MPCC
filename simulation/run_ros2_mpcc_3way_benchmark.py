@@ -45,7 +45,10 @@ import mujoco
 from dfe_mpcc_amr_controller import DFEMPCCAMRController
 from iso8608_road_profile import ISO8608RoadProfile, get_world7_zone_friction
 from test_sim_amr_closed_loop import update_dynamic_obstacles, Lidar
-from mecanum_traction_dynamics import compute_dynamic_normal_loads
+from mecanum_traction_dynamics import (
+    M_1X, M_1Y, Z_SLOSH_X, Z_SLOSH_Y,
+    compute_dynamic_normal_loads,
+)
 from conformal_checkpoint_eval import load_conformal_calibration_budget
 from benchmark_world6_complex_4dyn_obs import compute_world6_slosh_elevation_mm
 
@@ -115,16 +118,15 @@ def evaluate_2way_slosh_and_fz_physics(
         z_road_mm=z_road_mm,
     )
 
-    m_liquid = 1.20
-    F_slosh_x = m_liquid * (a_bx + 9.81 * math.sin(phi_y))
-    F_slosh_y = m_liquid * (a_by + 9.81 * math.sin(phi_x))
+    F_slosh_x = M_1X * (a_bx - 9.81 * math.sin(phi_x))
+    F_slosh_y = M_1Y * (a_by + 9.81 * math.sin(phi_y))
     Fz_wheels, _ = compute_dynamic_normal_loads(
         m_total=7.25,
         a_body=[a_bx, a_by],
         f_slosh_body=[F_slosh_x, F_slosh_y],
         phi_body=[phi_x, phi_y],
         z_com=0.0555,
-        z_slosh=(0.0768, 0.0768),
+        z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
         fz_min=0.0,
     )
     fz_true_wheels = np.maximum(0.0, Fz_wheels + np.asarray(dfz_iso_wheels, dtype=float))
@@ -624,10 +626,12 @@ def run_single_variant_simulation(
         a_bx0 = c_th0 * st["a_act"][0] + s_th0 * st["a_act"][1]
         a_by0 = -s_th0 * st["a_act"][0] + c_th0 * st["a_act"][1]
 
-        d_mj.qpos[3] = np.clip(d_mj.qpos[3] + ((a_by0 + a_road_body[1]) / 9.81) * 0.08, -0.25, 0.25)
-        d_mj.qpos[4] = np.clip(d_mj.qpos[4] - ((a_bx0 + a_road_body[0]) / 9.81) * 0.08, -0.25, 0.25)
+        # qpos[3] = slosh_x (+a_bx0), qpos[4] = slosh_y (-a_by0) theo quy ước slosh3.xml
+        d_mj.qpos[3] = np.clip(d_mj.qpos[3] + ((a_bx0 + a_road_body[0]) / 9.81) * 0.08, -0.25, 0.25)
+        d_mj.qpos[4] = np.clip(d_mj.qpos[4] - ((a_by0 + a_road_body[1]) / 9.81) * 0.08, -0.25, 0.25)
 
-        for _ in range(10):
+        n_substeps_mj = max(1, int(round(nmpc_dt / float(model.opt.timestep))))
+        for _ in range(n_substeps_mj):
             mujoco.mj_step(model, d_mj)
 
         q_now = d_mj.qpos[:3].copy()
@@ -710,19 +714,20 @@ def run_single_variant_simulation(
         # Quét 180 tia LiDAR độc lập của robot này
         _, _, meas, hit, _ = lidar.scan(model, d_mj)
 
-        # Tính toán phản lực sóng sánh và tải bánh xe cho ROS 2 PlotJuggler Telemetry
-        th_x_deg = math.degrees(float(st["phi_x"]) + 0.35 * (a_by0 / 9.81))
-        th_y_deg = math.degrees(float(st["phi_y"]) - 0.35 * (a_bx0 / 9.81))
-        m_liquid = 1.20
-        F_slosh_x = m_liquid * (a_bx0 + 9.81 * math.sin(math.radians(th_y_deg)))
-        F_slosh_y = m_liquid * (a_by0 + 9.81 * math.sin(math.radians(th_x_deg)))
+        # Tính toán phản lực sóng sánh và tải bánh xe cho ROS 2 PlotJuggler Telemetry (đúng trục & Z_SLOSH)
+        th_x_rad = float(st["phi_x"]) + 0.35 * (a_bx0 / 9.81)
+        th_y_rad = float(st["phi_y"]) - 0.35 * (a_by0 / 9.81)
+        th_x_deg = math.degrees(th_x_rad)
+        th_y_deg = math.degrees(th_y_rad)
+        F_slosh_x = M_1X * (a_bx0 - 9.81 * math.sin(th_x_rad))
+        F_slosh_y = M_1Y * (a_by0 + 9.81 * math.sin(th_y_rad))
         Fz_wheels, (M_pitch, M_roll) = compute_dynamic_normal_loads(
             m_total=7.25,
             a_body=[a_bx0, a_by0],
             f_slosh_body=[F_slosh_x, F_slosh_y],
-            phi_body=[math.radians(th_x_deg), math.radians(th_y_deg)],
+            phi_body=[th_x_rad, th_y_rad],
             z_com=0.0555,
-            z_slosh=(0.0768, 0.0768),
+            z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
             fz_min=0.889
         )
         st["fz_wheels"] = Fz_wheels

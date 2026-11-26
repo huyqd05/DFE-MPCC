@@ -440,10 +440,12 @@ def run_gui_simulation(phase=2, controller_mode="proposed", speed_factor=1.0, ma
                 has_dyn_obs=(phase == 2)
             )
 
-            data.qpos[3] = np.clip(data.qpos[3] + (a_by0 / 9.81) * 0.08, -0.22, 0.22)
-            data.qpos[4] = np.clip(data.qpos[4] - (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+            # qpos[3] = slosh_x (+a_bx0), qpos[4] = slosh_y (-a_by0) theo quy ước slosh3.xml
+            data.qpos[3] = np.clip(data.qpos[3] + (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+            data.qpos[4] = np.clip(data.qpos[4] - (a_by0 / 9.81) * 0.08, -0.22, 0.22)
 
-            for _ in range(10):
+            n_substeps_mj = max(1, int(round(nmpc_dt / float(model.opt.timestep))))
+            for _ in range(n_substeps_mj):
                 mujoco.mj_step(model, data)
 
             sim_time += nmpc_dt

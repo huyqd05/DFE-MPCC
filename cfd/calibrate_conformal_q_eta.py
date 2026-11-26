@@ -45,7 +45,7 @@ from robot_model_amr_casadi import TANK_A, TANK_B, TANK_H, H_LIQUID, Z_COM, ZETA
 from mecanum_traction_dynamics import L_X, L_Y, Z_SLOSH_X, Z_SLOSH_Y
 from coupled_wcsph_2d_dual import DualSliceWCSPH
 from robust_wcsph import RobustWCSPH2D
-from planning.velocity_tube_h124 import CoupledVelocityTubeH124, FZ_NOM
+from planning.velocity_tube_h124 import CoupledVelocityTubeH124, FZ_NOM, compute_dbep_t2_braking_eta_mm
 from conformal_checkpoint_eval import (
     compute_conformal_quantile_q_eta,
     verify_coverage_one_sided_betabinomial,
@@ -201,7 +201,7 @@ def _evaluate_trajectory_exogenous_vs_wcsph(
     coth_x = float(1.0 / np.tanh(np.pi * H_LIQUID / TANK_A))
     f0_wheels = np.full(4, (M_TOTAL * g) / 4.0)
     s_pitch = np.array([-1.0, -1.0, +1.0, +1.0])
-    s_roll = np.array([-1.0, +1.0, -1.0, +1.0])
+    s_roll = np.array([-1.0, +1.0, +1.0, -1.0])  # [FL, FR, RR, RL]
     m_fl_g = max(1e-3, dual_sph.bridge.m_fl_total * g)
 
     records = []
@@ -239,8 +239,10 @@ def _evaluate_trajectory_exogenous_vs_wcsph(
         fz_dbep_cmp = float(np.min(fz_dbep_grid[sl]))
 
         v_exc = float(cp.get("v_ub_cp", geom_prof["v_ref_geom"][idx_p]))
-        a_brk_x = -min(planner.a_brake_max, 0.45) * (v_exc / max(planner.v_max, 1e-6))
+        a_brk_x = -planner.a_brake_max * min(1.0, max(0.0, v_exc) / 0.25)
         a_brk_y = -0.35 * ay_exc
+        t_brake_s = float(np.clip(v_exc / max(abs(a_brk_x), 0.15), 0.12, 0.22))
+        t2_window_s = float(np.clip(max(0.26, t_brake_s + 0.06), 0.26, 0.28))
 
         hyb = dual_sph.evaluate_hybrid_ba_checkpoint(
             base_ckpt=base_ckpt,
@@ -254,16 +256,17 @@ def _evaluate_trajectory_exogenous_vs_wcsph(
             phi_link_rad=phi_link,
             delta_psi_rad=delta_psi,
             t1_window_s=0.150,
-            t2_window_s=0.090,
+            t2_window_s=t2_window_s,
+            t_brake_s=t_brake_s,
         )
         eta_wcsph = hyb["eta_wcsph_t1_mm"]
         eta_wcsph_t2 = hyb["eta_wcsph_t2_mm"]
         res_sph = hyb["res_t1"]
 
-        # Phản thực tế T2 thuần ngoại sinh đồng bộ ghép cặp 2D (giảm 15% sóng ngang Y khi đảo chiều + 0.70 sóng dọc X)
-        eta_x_brk_mm = (0.5 * TANK_A * (abs(a_brk_x) / g)) * 1000.0 * 0.65
-        eta_y_brk_mm = (0.5 * TANK_B * (abs(a_brk_y) / g)) * 1000.0 * 0.35
-        eta_dbep_t2 = max(eta_dbep_cmp, 0.85 * eta_dbep_cmp + 0.70 * eta_x_brk_mm + eta_y_brk_mm)
+        # Phản thực tế T2 DBEP đồng bộ 2 pha phanh (a_brk -> coast) qua ZOH + Stokes bậc 2
+        eta_dbep_t2 = compute_dbep_t2_braking_eta_mm(
+            eta_dbep_cmp, ax_exc, ay_exc, a_brk_x, a_brk_y, t_brake_s, t2_window_s
+        )
         a_tot_t2_eff = max(a_tot, float(np.hypot(a_brk_x, a_brk_y)))
 
         zc_cp = float(zc_grid[idx_p])
@@ -297,6 +300,8 @@ def _evaluate_trajectory_exogenous_vs_wcsph(
             "eta_wcsph_t2_mm": float(eta_wcsph_t2),
             "e_raw_eta_t2_mm": float(eta_wcsph_t2 - eta_dbep_t2),
             "t2_surge_mm": float(max(0.0, eta_wcsph_t2 - eta_wcsph)),
+            "t2_window_ms": float(hyb["t2_window_ms"]),
+            "t_brake_ms": float(hyb["t_brake_ms"]),
             "worst_phase_gain": float(hyb["worst_phase_gain"]),
             "fz_dbep_N": fz_dbep_cmp,
             "fz_wcsph_N": float(fz_wcsph),
@@ -390,9 +395,9 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
 
     planner = CoupledVelocityTubeH124(mu_default=0.35, kappa_th=1.05)
 
-    # Khởi tạo trình giải WCSPH đồng nhất hoàn toàn với Stage B: dp = 0.005 m (800+486=1286 hạt, dt = 60 us)
+    # Khởi tạo trình giải WCSPH đồng nhất với Stage B: dp = 0.005 m (800+486=1286 hạt, dt = 80 us < dt_cfl = 99 us)
     dp_cal = 0.005
-    dt_cal = 0.000060
+    dt_cal = 0.000080
     dual_sph = DualSliceWCSPH(Lx=TANK_A, Ly=TANK_B, tank_height=TANK_H, h=H_LIQUID, dp=dp_cal)
     for _ in range(10):
         dual_sph.step(dt_cal, ax=0.0, ay=0.0)
@@ -407,12 +412,16 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     if cache_path is None:
         cache_path = os.path.join(_root, "config", ".conformal_dp5_cache.json")
 
-    cache = {"dp_cal": dp_cal, "dt_cal": dt_cal, "train": {}, "cal": {}}
+    cache = {"schema_version": "t2_extended_v3", "dp_cal": dp_cal, "dt_cal": dt_cal, "train": {}, "cal": {}}
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f_c:
                 loaded = json.load(f_c)
-            if abs(float(loaded.get("dp_cal", -1.0)) - dp_cal) < 1e-12 and abs(float(loaded.get("dt_cal", -1.0)) - dt_cal) < 1e-12:
+            if (
+                loaded.get("schema_version") == "t2_extended_v3"
+                and abs(float(loaded.get("dp_cal", -1.0)) - dp_cal) < 1e-12
+                and abs(float(loaded.get("dt_cal", -1.0)) - dt_cal) < 1e-12
+            ):
                 cache = loaded
                 print(
                     f"[Cache] Đã nạp cache tạm từ {os.path.basename(cache_path)}: "
@@ -423,7 +432,7 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
             print(f"[Cache] Bỏ qua cache lỗi ({exc}), khởi tạo mới.", flush=True)
 
     budget_rem = int(max_new_trajs) if max_new_trajs and max_new_trajs > 0 else None
-    print(f"\n[Chuẩn bị] Hybrid B+A (T1=150 ms, T2=90 ms) | dp={dp_cal*1000:.1f} mm, dt={dt_cal*1e6:.0f} us | {max_workers} tiến trình song song", flush=True)
+    print(f"\n[Chuẩn bị] Hybrid B+A (T1=150 ms, T2=[260,280] ms) | dp={dp_cal*1000:.1f} mm, dt={dt_cal*1e6:.0f} us | {max_workers} tiến trình song song", flush=True)
 
     # Bước 1: Chạy 20 quỹ đạo huấn luyện D_train (80 CP -> 160 điểm T1+T2) để khớp OLS độ chệch tất định b_bar_eta(a/g) & b_bar_Fz(a/g)
     n_train_traj = 20
@@ -453,16 +462,21 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     e_eta_train_all = np.concatenate([e_eta_train_t1, e_eta_train_t2])
     e_fz_train = np.array([r["e_raw_fz_N"] for r in train_recs], dtype=float)
 
-    # Hồi quy tuyến tính OLS tự nhiên trên tập Huấn luyện (gộp T1+T2, không ép kẹp cứng b0 = 0.15 mm)
-    slope_eta, intercept_eta = np.polyfit(a_g_train_all, e_eta_train_all, 1)
+    # Hồi quy tuyến tính OLS TÁCH BIỆT cho T1 (không âm) và T2 (có dấu) trên tập Huấn luyện D_train
+    slope_eta, intercept_eta = np.polyfit(a_g_train_t1, e_eta_train_t1, 1)
     if intercept_eta < 0.0:
         b0_mm = 0.0
-        b1_mm = float(max(0.0, np.dot(a_g_train_all, e_eta_train_all) / max(np.dot(a_g_train_all, a_g_train_all), 1e-12)))
+        b1_mm = float(max(0.0, np.dot(a_g_train_t1, e_eta_train_t1) / max(np.dot(a_g_train_t1, a_g_train_t1), 1e-12)))
     else:
         b0_mm = float(intercept_eta)
         b1_mm = float(max(0.0, slope_eta))
-    bias_pred_train = np.maximum(0.0, b0_mm + b1_mm * a_g_train_all)
-    bias_eta_max_mm = float(round(float(np.percentile(bias_pred_train, 95)), 3))
+    bias_pred_train_t1 = np.maximum(0.0, b0_mm + b1_mm * a_g_train_t1)
+    bias_eta_max_mm = float(round(float(np.percentile(bias_pred_train_t1, 95)), 3))
+
+    slope_t2, intercept_t2 = np.polyfit(a_g_train_t2, e_eta_train_t2, 1)
+    bias_t2_b0_mm = float(intercept_t2)
+    bias_t2_b1_mm = float(slope_t2)
+    bias_t2_p95_mm = float(round(float(np.percentile(bias_t2_b0_mm + bias_t2_b1_mm * a_g_train_t2, 95)), 3))
 
     slope_fz, intercept_fz = np.polyfit(a_g_train_t1, e_fz_train, 1)
     if intercept_fz < 0.0:
@@ -474,9 +488,10 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     bias_fz_pred_train = np.maximum(0.0, bias_fz_b0_N + bias_fz_b1_N * a_g_train_t1)
     bias_fz_max_N = float(round(float(np.percentile(bias_fz_pred_train, 95)), 4))
 
-    print(f"\n[Bước 1] Hồi quy OLS tự nhiên trên D_train ({len(train_recs)} CP x 2 nhánh = {len(a_g_train_all)} điểm T1+T2):")
-    print(f"         b0 = {b0_mm:.4f} mm, b1 = {b1_mm:.4f} mm/(a/g), b_eta,max = {bias_eta_max_mm:.3f} mm")
-    print(f"         b_Fz0 = {bias_fz_b0_N:.4f} N, b_Fz1 = {bias_fz_b1_N:.4f} N/(a/g), b_Fz,max = {bias_fz_max_N:.4f} N")
+    print(f"\n[Bước 1] Hồi quy OLS tách biệt trên D_train ({len(train_recs)} CP T1 + {len(train_recs)} CP T2):")
+    print(f"         T1: b0 = {b0_mm:.4f} mm, b1 = {b1_mm:.4f} mm/(a/g), b_eta,max = {bias_eta_max_mm:.3f} mm")
+    print(f"         T2: b0_t2 = {bias_t2_b0_mm:.4f} mm, b1_t2 = {bias_t2_b1_mm:.4f} mm/(a/g), p95 = {bias_t2_p95_mm:.3f} mm")
+    print(f"         Fz: b_Fz0 = {bias_fz_b0_N:.4f} N, b_Fz1 = {bias_fz_b1_N:.4f} N/(a/g), b_Fz,max = {bias_fz_max_N:.4f} N")
 
     # Bước 2: Chạy tập hiệu chuẩn độc lập D_cal (50 quỹ đạo x 4 CP = 200 CP -> 400 điểm T1+T2) KHÔNG rò rỉ dữ liệu train
     n_cal_traj = 50
@@ -513,7 +528,7 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     eta_rom_corr_t1_cal = eta_dbep_t1_cal + bias_eta_t1_cal
     r_eta_t1_cal = eta_wcsph_t1_cal - eta_rom_corr_t1_cal
 
-    bias_eta_t2_cal = np.minimum(bias_eta_max_mm, b0_mm + b1_mm * a_g_t2_cal)
+    bias_eta_t2_cal = bias_t2_b0_mm + bias_t2_b1_mm * a_g_t2_cal
     eta_rom_corr_t2_cal = eta_dbep_t2_cal + bias_eta_t2_cal
     r_eta_t2_cal = eta_wcsph_t2_cal - eta_rom_corr_t2_cal
 
@@ -554,13 +569,16 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     )
     # Bổ sung phân vị Split Conformal 1 chiều cho biên sóng sánh |r_eta| và độ dâng phanh T2
     uni_eta = compute_conformal_quantile_q_eta(np.abs(r_eta_cal), alpha=alpha)
+    uni_eta_t2 = compute_conformal_quantile_q_eta(np.abs(r_eta_t2_cal), alpha=alpha)
     uni_t2 = compute_conformal_quantile_q_eta(t2_surge_cal, alpha=alpha)
     beta_cov = verify_coverage_one_sided_betabinomial(np.abs(r_eta_cal), float(uni_eta["q_hat"]), n_cal_samples, alpha)
 
     q_eta_rom_mm = float(round(max(joint_bounds["q_eta_rom_mm"], uni_eta["q_hat"]), 3))
     q_fz_rom_N = float(round(joint_bounds["q_fz_rom_N"], 3))
     q_eta_t2_surge_mm = float(round(float(uni_t2["q_hat"]), 3))
+    q_eta_t2_rom_mm = float(round(float(uni_eta_t2["q_hat"]), 3))
     q_eta_total_rom_mm = float(round(bias_eta_max_mm + q_eta_rom_mm, 3))
+    q_eta_t2_total_mm = float(round(max(q_eta_total_rom_mm, max(0.0, bias_t2_p95_mm) + q_eta_t2_rom_mm), 3))
     q_eta_cl_mm = float(round(q_eta_total_rom_mm + q_eta_t2_surge_mm, 3))
 
     # Bước 5: Nghiên cứu hội tụ lưới 3 mức Roache GCI (Celik et al., 2008) tại dp in {10.0, 5.0, 3.5} mm + RobustWCSPH2D
@@ -606,9 +624,9 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
         ckpt_g = sph_g.save_checkpoint()
         hyb_g = sph_g.evaluate_hybrid_ba_checkpoint(
             base_ckpt=ckpt_g, dt=dt_g, ax_exc=0.12, ay_exc=0.91,
-            a_brk_x=-0.35, a_brk_y=-0.32, ay_prev_geom=0.0,
+            a_brk_x=-0.65, a_brk_y=-0.32, ay_prev_geom=0.0,
             gamma_link=0.0, phi_link_rad=0.0, delta_psi_rad=0.80,
-            t1_window_s=0.150, t2_window_s=0.090,
+            t1_window_s=0.150, t2_window_s=0.280, t_brake_s=0.220,
         )
         t_gel = time.perf_counter() - t_g0
         gci_levels.append({
@@ -672,13 +690,15 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
     cal_payload = {
         "calibrated_at": datetime.now().isoformat(),
         "pipeline_runtime_s": round(elapsed_s, 3),
-        "method": "Split Conformal over Offline A* Geometric Primitives Dictionary (Hybrid B+A: Long-Window T1=150ms & Braking T2=90ms DualSliceWCSPH vs Exogenous DBEP)",
+        "method": "Split Conformal over Offline A* Geometric Primitives Dictionary (Hybrid B+A: T1=150ms & Extended T2=[260,280]ms Full-Stop Braking DualSliceWCSPH vs ZOH DBEP)",
         "hybrid_ba_enabled": True,
         "d_cal_includes_t2": True,
         "dp_cal_m": dp_cal,
         "dt_cal_s": dt_cal,
         "t1_window_ms": 150.0,
-        "t2_window_ms": 90.0,
+        "t2_window_ms": round(float(np.mean([r.get("t2_window_ms", 280.0) for r in cal_recs])), 1),
+        "t2_window_range_ms": [260.0, 280.0],
+        "a_brake_max_cal": float(planner.a_brake_max),
         "n_train": len(train_recs),
         "n_cal": n_cal_samples,
         "n_cal_points_total": int(len(eta_wcsph_all_cal)),
@@ -692,10 +712,14 @@ def run_conformal_calibration_pipeline(max_new_trajs: int = 0, cache_path: str =
         "bias_b0_mm": round(b0_mm, 4),
         "bias_b1_mm": round(b1_mm, 4),
         "bias_eta_max_mm": round(bias_eta_max_mm, 3),
+        "bias_t2_b0_mm": round(bias_t2_b0_mm, 4),
+        "bias_t2_b1_mm": round(bias_t2_b1_mm, 4),
         "bias_fz_b0_N": round(bias_fz_b0_N, 4),
         "bias_fz_b1_N": round(bias_fz_b1_N, 4),
         "bias_fz_max_N": round(bias_fz_max_N, 4),
         "q_eta_rom_mm": q_eta_rom_mm,
+        "q_eta_t2_rom_mm": q_eta_t2_rom_mm,
+        "q_eta_t2_total_mm": q_eta_t2_total_mm,
         "q_fz_rom_N": q_fz_rom_N,
         "q_eta_t2_surge_mm": q_eta_t2_surge_mm,
         "q_eta_total_rom_mm": q_eta_total_rom_mm,

@@ -111,7 +111,7 @@ def test_2_dry_tank_rigid_load_transfer_in_mujoco():
     M_roll = m_dry * z_dry * ay
 
     s_pitch = np.array([-1.0, -1.0, 1.0, 1.0])
-    s_roll  = np.array([-1.0, 1.0, -1.0, 1.0])
+    s_roll  = np.array([-1.0, 1.0, 1.0, -1.0])  # [FL, FR, RR, RL]
 
     dFz_theoretical = s_pitch * (M_pitch / (2.0 * l_wb)) + s_roll * (M_roll / (2.0 * t_w))
     Fz_theoretical = (m_dry * g) / 4.0 + dFz_theoretical
@@ -134,17 +134,19 @@ def test_3_no_double_one_over_sqrt2_and_guaranteed_allocation():
     """
     Test 3 (No Double 1/sqrt(2) & Guaranteed Wheel Allocation - Lỗi A.8):
     1. Kiểm tra trạng thái kéo dọc thuần tối đa F_x,max = 2*sqrt(2)*mu*Fz_w.
-    2. Kiểm tra 1,000 mẫu Wrench ngẫu nhiên trong Zonotope cho max_violation < 1e-7.
+    2. Kiểm tra 1,000 mẫu Wrench ngẫu nhiên (cả f_bar bất đối xứng) trong Zonotope [FL, FR, RR, RL]
+       đạt max_violation < 1e-7 và tái tạo đúng G @ f_wheel == W_cmd.
     """
     c45 = 1.0 / np.sqrt(2.0)
     lx = 0.12
     ly = 0.14
     L_sum = lx + ly
 
+    # Thứ tự chuẩn toàn codebase: [FL, FR, RR, RL]
     G = c45 * np.array([
         [ 1.0,  1.0,  1.0,  1.0],
-        [-1.0,  1.0,  1.0, -1.0],
-        [-L_sum, L_sum, -L_sum, L_sum]
+        [-1.0,  1.0, -1.0,  1.0],
+        [-L_sum, L_sum, L_sum, -L_sum]
     ])
 
     mu = 0.35
@@ -160,13 +162,18 @@ def test_3_no_double_one_over_sqrt2_and_guaranteed_allocation():
         f"Fx_max = {Fx_max} khác với 2*sqrt(2)*mu*Fz = {expected_Fx_max}!"
     )
 
-    # 2. 1,000 vector Wrench ngẫu nhiên
+    # 2. 1,000 vector Wrench ngẫu nhiên (gồm 500 mẫu tải bất đối xứng giữa 4 bánh)
     np.random.seed(42)
+    f_bar_asym = mu * np.array([14.0, 21.0, 23.0, 13.0])
     violations = []
-    for _ in range(1000):
-        f_rand = np.random.uniform(-f_bar_vec, f_bar_vec)
+    for k in range(1000):
+        fb = f_bar_vec if k < 500 else f_bar_asym
+        f_rand = np.random.uniform(-fb, fb)
         W_cmd = G @ f_rand
-        res = allocate_mecanum_wheel_forces_guaranteed(W_cmd, f_bar_vec, lx, ly)
+        res = allocate_mecanum_wheel_forces_guaranteed(W_cmd, fb, lx, ly)
+        assert np.allclose(G @ res["f_wheel_scalar"], W_cmd, atol=1e-7), (
+            "Sai lệch tái tạo wrench từ phân bổ 4 bánh [FL, FR, RR, RL]!"
+        )
         violations.append(res["max_violation"])
 
     max_viol = max(violations)

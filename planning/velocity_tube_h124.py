@@ -105,6 +105,75 @@ def _analytical_benchmark_curve(x: np.ndarray):
     return y, dy, d2y, d3y
 
 
+def _slosh_zoh_matrices(omega: float, zeta: float, sigma: float, dt: float) -> tuple:
+    """Tính ma trận chuyển trạng thái rời rạc ZOH chính xác (Phi, Gam) cho dao động sóng 1 trục."""
+    sq = float(np.sqrt(max(1e-9, 1.0 - zeta ** 2)))
+    wd = float(omega * sq)
+    ez = float(np.exp(-zeta * omega * dt))
+    cw = float(np.cos(wd * dt))
+    sw = float(np.sin(wd * dt))
+    z_sq = zeta / sq
+    phi_mat = ez * np.array([
+        [cw + z_sq * sw, sw / wd],
+        [-(omega ** 2 / wd) * sw, cw - z_sq * sw],
+    ], dtype=float)
+    gam_vec = (float(sigma) / g) * np.array([
+        1.0 - ez * (cw + z_sq * sw),
+        (omega ** 2 / wd) * ez * sw,
+    ], dtype=float)
+    return phi_mat, gam_vec
+
+
+def compute_dbep_t2_braking_eta_mm(
+    eta_dbep_t1_mm: float,
+    ax_exc: float,
+    ay_exc: float,
+    a_brk_x: float,
+    a_brk_y: float,
+    t_brake_s: float,
+    t2_window_s: float,
+    dt_sim: float = 0.002,
+) -> float:
+    """
+    Mô hình rút gọn 2-DOF DBEP ZOH + Stokes bậc 2 cho nhánh phanh phản thực tế T2 2 pha:
+      1) Khởi phát trực tiếp từ trạng thái T1 DBEP (quy đổi Stokes eta_dbep_t1_mm -> phi_y0, phi_x0 = ax_exc / g).
+      2) Rẽ nhánh T2: phanh với (a_brk_x, a_brk_y) trong [0, t_brake_s] và dao động dư a=0 trong (t_brake_s, t2_window_s].
+    """
+    dt = float(dt_sim)
+    coth_x = 1.0 / max(float(np.tanh(np.pi * H_LIQUID / TANK_A)), 1e-6)
+    coth_y = 1.0 / max(float(np.tanh(np.pi * H_LIQUID / TANK_B)), 1e-6)
+    a_y_st = (np.pi * TANK_B / 8.0) * coth_y
+    b_y_st = 0.5 * TANK_B
+    eta_t1_m = max(0.0, float(eta_dbep_t1_mm)) * 1e-3
+    u_y0 = (-b_y_st + np.sqrt(b_y_st ** 2 + 4.0 * a_y_st * eta_t1_m)) / (2.0 * a_y_st)
+    phi_y0 = (-1.0 if ay_exc >= 0.0 else 1.0) * float(np.arctan(u_y0))
+    phi_x0 = float(ax_exc) / g
+
+    phi_x, gam_x = _slosh_zoh_matrices(omega_x, ZETA_SLOSH, +1.0, dt)
+    phi_y, gam_y = _slosh_zoh_matrices(omega_y, ZETA_SLOSH, -1.0, dt)
+
+    st_x = np.array([phi_x0, 0.0], dtype=float)
+    st_y = np.array([phi_y0, 0.0], dtype=float)
+
+    n2 = max(1, int(round(t2_window_s / dt)))
+    n2_brk = max(1, min(n2, int(round(t_brake_s / dt)))) if t_brake_s is not None else n2
+    max_phi_x = abs(float(st_x[0]))
+    max_phi_y = abs(float(st_y[0]))
+    for step_i in range(n2):
+        ax_k = a_brk_x if step_i < n2_brk else 0.0
+        ay_k = a_brk_y if step_i < n2_brk else 0.0
+        st_x = phi_x @ st_x + gam_x * ax_k
+        st_y = phi_y @ st_y + gam_y * ay_k
+        max_phi_x = max(max_phi_x, abs(float(st_x[0])))
+        max_phi_y = max(max_phi_y, abs(float(st_y[0])))
+
+    u_x = float(np.tan(min(1.2, max_phi_x)))
+    u_y = float(np.tan(min(1.2, max_phi_y)))
+    eta_x_t2_mm = (0.5 * TANK_A * u_x + (np.pi * TANK_A / 8.0) * coth_x * (u_x ** 2)) * 1000.0
+    eta_y_t2_mm = (0.5 * TANK_B * u_y + (np.pi * TANK_B / 8.0) * coth_y * (u_y ** 2)) * 1000.0
+    return float(max(eta_dbep_t1_mm, max(0.85 * eta_dbep_t1_mm, eta_y_t2_mm) + 0.70 * eta_x_t2_mm))
+
+
 class CoupledVelocityTubeH124:
     """
     Bộ quy hoạch Ống vận tốc khả thi bậc 3 tích hợp toán tử điểm bất động co
@@ -140,6 +209,9 @@ class CoupledVelocityTubeH124:
         fp_max_iter: int = 10,
         enable_grip: bool = True,
         enable_traction: bool = True,
+        enable_coupled_frenet_jerk: bool = False,
+        enable_t2_braking_budget: bool = True,
+        v_brk_sat: float = 0.25,
         a_y_geom_max: float = 0.875,
         use_exogenous_geom_checkpoint: bool = True,
         use_physics_cp_constraints: bool = True,
@@ -161,14 +233,18 @@ class CoupledVelocityTubeH124:
         self.bias_b0_mm = 0.42
         self.bias_b1_mm = 4.80
         self.bias_eta_max_mm = float(bias_eta_max_mm)
+        self.bias_t2_b0_mm = 0.0
+        self.bias_t2_b1_mm = 0.0
         self.bias_fz_b0_N = 0.18
         self.bias_fz_b1_N = 1.65
         self.bias_fz_max_N = 0.55
         self.q_eta_rom_mm = float(q_eta_rom_mm)
         self.q_fz_rom_N = float(q_fz_base)
         self.q_eta_mm = self.bias_eta_max_mm + self.q_eta_rom_mm  # đồng bộ từ JSON sau _lookup
+        self.q_eta_t2_total_mm = self.q_eta_mm
         self.q_eta_cl_mm = float(q_eta_cl_mm)
         self.eta_bound_cl_mm = self.eta_design_mm + self.q_eta_cl_mm
+        self.eta_brk_x_mm = None
         self._explicit_conformal_override = (
             abs(self.bias_eta_max_mm - 1.15) > 1e-9
             or abs(self.q_eta_rom_mm - 1.60) > 1e-9
@@ -189,6 +265,9 @@ class CoupledVelocityTubeH124:
         self.fp_max_iter = int(fp_max_iter)
         self.enable_grip = bool(enable_grip)
         self.enable_traction = bool(enable_traction)
+        self.enable_coupled_frenet_jerk = bool(enable_coupled_frenet_jerk)
+        self.enable_t2_braking_budget = bool(enable_t2_braking_budget)
+        self.v_brk_sat = float(v_brk_sat)
         self.a_y_geom_max = float(a_y_geom_max)
         self.use_exogenous_geom_checkpoint = bool(use_exogenous_geom_checkpoint)
         self.use_physics_cp_constraints = bool(use_physics_cp_constraints)
@@ -722,9 +801,14 @@ class CoupledVelocityTubeH124:
             if "q_eta_cl_mm" in payload:
                 self.q_eta_cl_mm = float(payload["q_eta_cl_mm"])
                 self.eta_bound_cl_mm = self.eta_design_mm + self.q_eta_cl_mm
+            if "bias_t2_b0_mm" in payload:
+                self.bias_t2_b0_mm = float(payload["bias_t2_b0_mm"])
+            if "bias_t2_b1_mm" in payload:
+                self.bias_t2_b1_mm = float(payload["bias_t2_b1_mm"])
             new_q_eta_mm = self.bias_eta_max_mm + self.q_eta_rom_mm
             if abs(new_q_eta_mm - self.q_eta_mm) > 1e-9:
                 self._update_allowable_angles_from_q_eta(new_q_eta_mm)
+            self.q_eta_t2_total_mm = float(payload.get("q_eta_t2_total_mm", self.q_eta_mm))
 
         a_max_geom_g = 0.0
         if geom_prof and "a_tot_geom" in geom_prof:
@@ -934,7 +1018,8 @@ class CoupledVelocityTubeH124:
     ):
         """
         Tính trần vận tốc cơ học (Mô-đun M2 & M4):
-        1. Giới hạn độ giật ngang hình học: v_jerk_raw(s) = (j_y_max / (|kappa'(s)| + 1e-6))^(1/3).
+        1. Giới hạn độ giật ngang Frenet đầy đủ v_jerk_raw(s):
+           |kappa'(s)| v^3 + 3 |kappa(s)| |a_x(s)| v <= j_y_max.
         2. Đa diện ma sát Zonotope 12 mặt 3D có thành phần mô-men xoay M_z:
            Trả về đồng thời v_grip_2d_static (ax=0, Mz=0), v_grip_2d_dyn (có ax, Mz=0) và v_grip_raw (đầy đủ 3D).
         3. Chống nhấc bánh Fz_w >= Fz_min = 3.50 N trên hệ 4 bánh siêu tĩnh (hyperstatic Mecanum chassis):
@@ -954,8 +1039,18 @@ class CoupledVelocityTubeH124:
         if delta_warp_grid is None:
             delta_warp_grid = np.zeros(n, dtype=float)
 
-        # 1. Trần độ giật ngang hình học v_jerk_raw
-        v_jerk_raw = (self.j_y_max / abs_dk) ** (1.0 / 3.0)
+        # 1. Trần độ giật ngang v_jerk_raw:
+        # Mặc định dùng công thức hình học đã hiệu chuẩn đồng bộ với conformal_calibration_q_eta.json;
+        # khi enable_coupled_frenet_jerk=True, giải phương trình bậc ba Frenet đầy đủ |kappa'|v^3 + 3|kappa||a_x|v <= j_y_max.
+        if self.enable_coupled_frenet_jerk:
+            p_jerk = (3.0 * np.abs(kappa) * np.abs(ax_est)) / abs_dk
+            q_jerk = self.j_y_max / abs_dk
+            disc_jerk = np.sqrt(0.25 * (q_jerk ** 2) + (p_jerk / 3.0) ** 3)
+            u_jerk = np.cbrt(0.5 * q_jerk + disc_jerk)
+            w_jerk = p_jerk / (3.0 * np.maximum(u_jerk, 1e-12))
+            v_jerk_raw = q_jerk / np.maximum(u_jerk ** 2 + p_jerk / 3.0 + w_jerk ** 2, 1e-12)
+        else:
+            v_jerk_raw = (self.j_y_max / abs_dk) ** (1.0 / 3.0)
         v_jerk = np.minimum(self.v_max, v_jerk_raw)
 
         # 2. Trần bám đường đa diện Zonotope 3D (F_bx, F_by, M_z)
@@ -1111,6 +1206,28 @@ class CoupledVelocityTubeH124:
         longitudinal_deduction = np.minimum(0.32 * theta_allow_y_mod, (TANK_A / TANK_B) * (0.38 * th_x_env))
         theta_allow_y_eff = np.maximum(0.04, theta_allow_y_mod - longitudinal_deduction)
 
+        if self.enable_t2_braking_budget:
+            a_b_eff = self.a_brake_max * np.minimum(
+                1.0, np.maximum(0.0, v_current) / max(self.v_brk_sat, 1e-3)
+            )
+            phi_eq_brk_x = a_b_eff / g
+            wx_col = (omega_x * self.freq_scales)[:, None]
+            e_brk_x_all = np.sqrt((np.abs(th_x_arr) + phi_eq_brk_x[None, :]) ** 2 + (om_x_arr / wx_col) ** 2)
+            phi_brk_x = np.minimum(0.55, phi_eq_brk_x + np.max(e_brk_x_all, axis=0))
+            u_bx = np.tan(phi_brk_x)
+            eta_brk_x_mm = (0.5 * TANK_A * u_bx + (np.pi * TANK_A / 8.0) * self.coth_x * (u_bx ** 2)) * 1000.0
+            h_eff_t2_mm = max(8.0, self.h_free_mm - self.q_eta_t2_total_mm)
+            eta_y_allow_t2_mm = np.maximum(
+                4.0,
+                np.minimum(h_eff_t2_mm - 0.35 * eta_brk_x_mm, (h_eff_t2_mm - eta_brk_x_mm) / 0.35),
+            )
+            a_y_st = (np.pi * TANK_B / 8.0) * self.coth_y
+            b_y_st = 0.5 * TANK_B
+            u_y_t2 = (-b_y_st + np.sqrt(b_y_st ** 2 + 4.0 * a_y_st * (eta_y_allow_t2_mm * 1e-3))) / (2.0 * a_y_st)
+            theta_allow_y_t2 = np.arctan(u_y_t2)
+            theta_allow_y_eff = np.minimum(theta_allow_y_eff, theta_allow_y_t2)
+            self.eta_brk_x_mm = eta_brk_x_mm
+
         E_y_in_grid = np.zeros(n, dtype=float)
         e_all_freq = np.sqrt(th_y_arr ** 2 + om_y_scaled ** 2)
         if len(self.freq_scales) > 1:
@@ -1190,13 +1307,13 @@ class CoupledVelocityTubeH124:
         n_fluid_total = dual_sph.solver_xz.n_fluid + dual_sph.solver_yz.n_fluid
         n_bound_total = dual_sph.solver_xz.n_bound + dual_sph.solver_yz.n_bound
 
-        dt_cfl = 0.000060
+        dt_cfl = 0.000080
         res0 = dual_sph.step(dt_cfl, ax=0.0, ay=0.0)
         eta0_x = res0["eta_peak_x"]
         eta0_y = res0["eta_peak_y"]
         f0_wheels = np.full(4, (M_TOTAL * g) / 4.0)
         s_pitch = np.array([-1.0, -1.0, +1.0, +1.0])
-        s_roll  = np.array([-1.0, +1.0, -1.0, +1.0])
+        s_roll  = np.array([-1.0, +1.0, +1.0, -1.0])  # [FL, FR, RR, RL]
 
         raw_residuals_eta_mm = []
         debiased_residuals_eta_mm = []
@@ -1305,9 +1422,11 @@ class CoupledVelocityTubeH124:
             eta_rom_corr_cp = eta_dbep_cmp + bias_eta_cp
             fz_rom_corr_cp = max(0.0, fz_dbep_cmp - bias_fz_cp)
 
-            # 1-3. Đánh giá tổng hợp Checkpoint theo chuẩn Hybrid B+A (cửa sổ dài T1=150ms, quét pha carryover & phanh T2=90ms)
-            a_brk_x = -min(self.a_brake_max, 0.45) * (v_exc / max(self.v_max, 1e-6))
+            # 1-3. Đánh giá tổng hợp Checkpoint theo chuẩn Hybrid B+A (T1=150ms, quét pha & phanh dừng mở rộng T2=[260,280]ms)
+            a_brk_x = -self.a_brake_max * min(1.0, max(0.0, v_exc) / max(self.v_brk_sat, 1e-3))
             a_brk_y = -0.35 * ay_exc
+            t_brake_s = float(np.clip(v_exc / max(abs(a_brk_x), 0.15), 0.12, 0.22))
+            t2_window_s = float(np.clip(max(0.26, t_brake_s + 0.06), 0.26, 0.28))
             hyb = dual_sph.evaluate_hybrid_ba_checkpoint(
                 base_ckpt=base_sph_ckpt,
                 dt=dt_cfl,
@@ -1320,7 +1439,8 @@ class CoupledVelocityTubeH124:
                 phi_link_rad=phi_link_cp,
                 delta_psi_rad=delta_psi_cp,
                 t1_window_s=0.150,
-                t2_window_s=0.090,
+                t2_window_s=t2_window_s,
+                t_brake_s=t_brake_s,
             )
             res_sph = hyb["res_t1"]
             res_t2 = hyb["res_t2"]
@@ -1362,12 +1482,12 @@ class CoupledVelocityTubeH124:
             )))
             cp["fz_wcsph_at_tube_N"] = round(fz_wcsph_at_tube_cp, 2)
 
-            # Phản thực tế phanh khẩn cấp T2 thuần ngoại sinh đồng bộ ghép cặp 2D (không tuần hoàn vào SPH)
-            eta_x_brk_mm = (0.5 * TANK_A * (abs(a_brk_x) / g)) * 1000.0 * 0.65
-            eta_y_brk_mm = (0.5 * TANK_B * (abs(a_brk_y) / g)) * 1000.0 * 0.35
-            eta_dbep_t2_mm = max(eta_dbep_cmp, 0.85 * eta_dbep_cmp + 0.70 * eta_x_brk_mm + eta_y_brk_mm)
+            # Phản thực tế phanh khẩn cấp T2 đồng bộ 2 pha phanh ZOH + Stokes bậc 2 (không tuần hoàn vào SPH)
+            eta_dbep_t2_mm = compute_dbep_t2_braking_eta_mm(
+                eta_dbep_cmp, ax_exc, ay_exc, a_brk_x, a_brk_y, t_brake_s, t2_window_s
+            )
             a_tot_t2_eff = max(a_tot_exc, float(np.hypot(a_brk_x, a_brk_y)))
-            bias_eta_t2 = min(self.bias_eta_max_mm, b0_mm + b1_mm * (a_tot_t2_eff / g))
+            bias_eta_t2 = float(getattr(self, "bias_t2_b0_mm", 0.0)) + float(getattr(self, "bias_t2_b1_mm", 0.0)) * (a_tot_t2_eff / g)
             eta_rom_corr_t2 = eta_dbep_t2_mm + bias_eta_t2
             cp["eta_dbep_cmp_mm"] = round(float(eta_dbep_cmp), 2)
             cp["fz_dbep_cmp_N"] = round(float(fz_dbep_cmp), 2)

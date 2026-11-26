@@ -100,11 +100,11 @@ class CoSimMassMomentBridge:
         dM_roll_ground  = dM_roll_bottom  + self.z_tank * dFy_slosh
 
         # 4. Phân bổ độ lệch tải pháp tuyến thuần động do slosh cho 4 bánh xe:
-        # Thứ tự bánh: w=0 (FL: trước-trái), w=1 (FR: trước-phải), w=2 (RL: sau-trái), w=3 (RR: sau-phải)
+        # Thứ tự bánh chuẩn toàn codebase: w=0 (FL: trước-trái), w=1 (FR: trước-phải), w=2 (RR: sau-phải), w=3 (RL: sau-trái)
         # s_pitch = -1 cho bánh trước, +1 cho bánh sau (khi dM_pitch_ground > 0 làm dồn tải ra bánh sau)
         # s_roll  = -1 cho bánh trái, +1 cho bánh phải (khi dM_roll_ground > 0 làm dồn tải sang bánh phải)
         s_pitch = np.array([-1.0, -1.0, +1.0, +1.0])
-        s_roll  = np.array([-1.0, +1.0, -1.0, +1.0])
+        s_roll  = np.array([-1.0, +1.0, +1.0, -1.0])
 
         dFz_slosh_wheels = (
             s_pitch * (dM_pitch_ground / (2.0 * self.l_wb)) +

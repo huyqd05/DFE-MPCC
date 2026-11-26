@@ -484,9 +484,9 @@ def run_benchmark_world8():
             a_bx = c_th0 * a_act[0] + s_th0 * a_act[1]
             a_by = -s_th0 * a_act[0] + c_th0 * a_act[1]
 
-            # Cập nhật góc con lắc chất lỏng theo gia tốc quán tính thân xe + kích động nền đường (thống nhất World 6 & 7)
-            data_sim.qpos[3] = float(np.clip(data_sim.qpos[3] + ((a_by + a_road_body[1]) / 9.81) * 0.08, -0.25, 0.25))
-            data_sim.qpos[4] = float(np.clip(data_sim.qpos[4] - ((a_bx + a_road_body[0]) / 9.81) * 0.08, -0.25, 0.25))
+            # Cập nhật góc con lắc chất lỏng đúng trục slosh3.xml: qpos[3]=slosh_x (+a_bx), qpos[4]=slosh_y (-a_by)
+            data_sim.qpos[3] = float(np.clip(data_sim.qpos[3] + ((a_bx + a_road_body[0]) / 9.81) * 0.08, -0.25, 0.25))
+            data_sim.qpos[4] = float(np.clip(data_sim.qpos[4] - ((a_by + a_road_body[1]) / 9.81) * 0.08, -0.25, 0.25))
 
             for sub in range(substeps):
                 tau_sub = (sub + 1) * dt_sim

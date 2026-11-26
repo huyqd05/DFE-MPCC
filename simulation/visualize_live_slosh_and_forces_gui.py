@@ -12,7 +12,7 @@ Trực quan hóa ĐỒNG THỜI 2 CỬA SỔ thời gian thực (Real-Time Synch
   2. CỬA SỔ ĐỒ THỊ ĐỘNG LỰC HỌC (LIVE TELEMETRY DASHBOARD - 4 SUBPLOTS):
      - Panel 1: Góc lắc nước theta_x(t), theta_y(t) (độ) & Độ dâng sóng eta(t) (mm)
        kèm 3 vạch ngưỡng: Bao Conformal 19.40 mm, Giới hạn Stokes 20.00 mm, Tràn bể 30.00 mm.
-     - Panel 2: Phản lực pháp tuyến tiếp xúc mặt sàn lên 4 bánh xe F_z,FL, FR, RL, RR (N)
+     - Panel 2: Phản lực pháp tuyến tiếp xúc mặt sàn lên 4 bánh xe F_z,FL, FR, RR, RL (N)
        và tải nhỏ nhất F_z,min(t) kèm vạch đỏ ngưỡng nguy cơ nhấc bánh 3.0 N.
      - Panel 3: Phản lực sóng sánh FSI F_slosh,x, F_slosh,y (N) tác dụng ngược lên thân xe
        và mô-men lật ngang M_roll (N.m).
@@ -49,7 +49,10 @@ _CAL_BUDGET = load_conformal_calibration_budget()
 from astar import AStarPlanner
 from dfe_mpcc_amr_controller import DFEMPCCAMRController
 from iso8608_road_profile import ISO8608RoadProfile, get_world7_zone_friction
-from mecanum_traction_dynamics import compute_dynamic_normal_loads
+from mecanum_traction_dynamics import (
+    M_1X, M_1Y, Z_SLOSH_X, Z_SLOSH_Y,
+    compute_dynamic_normal_loads,
+)
 from test_sim_amr_closed_loop import (
     load_combined_model,
     extract_map_from_model,
@@ -97,9 +100,9 @@ def evaluate_slosh_angles_and_elevation(variant_key, s_prog, v_lin, a_bx, a_by, 
     in_oil = math.exp(-0.5 * ((s_prog - 8.12) / 0.48) ** 2)
     in_ramp = math.exp(-0.5 * ((s_prog - 10.22) / 0.50) ** 2)
 
-    # Góc nước động học theo quán tính + con lắc
-    th_x_rad = float(phi_x) + 0.35 * (a_by / 9.81)
-    th_y_rad = float(phi_y) - 0.35 * (a_bx / 9.81)
+    # Góc nước động học theo quán tính + con lắc đúng quy ước trục slosh3.xml
+    th_x_rad = float(phi_x) + 0.35 * (a_bx / 9.81)
+    th_y_rad = float(phi_y) - 0.35 * (a_by / 9.81)
 
     th_x_deg = math.degrees(th_x_rad)
     th_y_deg = math.degrees(th_y_rad)
@@ -405,23 +408,25 @@ def run_variant_gui(variant_key, model, waypoints, dashboard, speed_factor=1.0, 
         data.qpos[3] = math.radians(th_x_deg)
         data.qpos[4] = math.radians(th_y_deg)
 
-        m_liquid = 1.20
-        F_slosh_x = m_liquid * (a_bx + 9.81 * math.sin(math.radians(th_y_deg)))
-        F_slosh_y = m_liquid * (a_by + 9.81 * math.sin(math.radians(th_x_deg)))
+        th_x_rad = math.radians(th_x_deg)
+        th_y_rad = math.radians(th_y_deg)
+        F_slosh_x = M_1X * (a_bx - 9.81 * math.sin(th_x_rad))
+        F_slosh_y = M_1Y * (a_by + 9.81 * math.sin(th_y_rad))
         F_slosh_mag = math.hypot(F_slosh_x, F_slosh_y)
 
         Fz_wheels, (M_pitch, M_roll) = compute_dynamic_normal_loads(
             m_total=7.25,
             a_body=[a_bx, a_by],
             f_slosh_body=[F_slosh_x, F_slosh_y],
-            phi_body=[math.radians(th_x_deg), math.radians(th_y_deg)],
+            phi_body=[th_x_rad, th_y_rad],
             z_com=0.0555,
-            z_slosh=(0.0768, 0.0768),
+            z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
             fz_min=0.889
         )
         fz_min_now = float(np.min(Fz_wheels))
 
-        for _ in range(10):
+        n_substeps_mj = max(1, int(round(nmpc_dt / float(model.opt.timestep))))
+        for _ in range(n_substeps_mj):
             mujoco.mj_step(model, data)
 
         sim_time += nmpc_dt

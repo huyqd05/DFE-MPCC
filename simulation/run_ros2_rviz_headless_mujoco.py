@@ -63,7 +63,7 @@ from test_sim_amr_closed_loop import (
 )
 from benchmark_world6_complex_4dyn_obs import compute_world6_slosh_elevation_mm
 from mecanum_traction_dynamics import (
-    M_TOTAL, M_1X, M_1Y, L_P_X, L_P_Y,
+    M_TOTAL, M_1X, M_1Y, L_P_X, L_P_Y, Z_SLOSH_X, Z_SLOSH_Y,
     compute_dynamic_normal_loads,
     allocate_wheel_forces_clamped,
     evaluate_traction_and_slip,
@@ -1317,6 +1317,7 @@ def run_ros2_rviz_headless_simulation(
     mujoco.mj_forward(model, data)
 
     nmpc_dt = 0.05
+    n_substeps = max(1, int(round(nmpc_dt / float(model.opt.timestep))))
     mu_plan_init = (
         float(np.asarray(tube_planner.get_horizon_mu_plan([0.0])).ravel()[0])
         if (tube_planner is not None and getattr(tube_planner, "is_ready", False))
@@ -1531,7 +1532,7 @@ def run_ros2_rviz_headless_simulation(
                 f_slosh_body=[F_slosh_bx_dyn, F_slosh_by_dyn],
                 phi_body=[phi_x_meas, phi_y_meas],
                 z_com=0.0555,
-                z_slosh=(0.0768, 0.0768),
+                z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
                 fz_min=0.889,
             )
             Fz_true = np.maximum(0.889, Fz_dyn + dfz_iso_now)
@@ -1581,10 +1582,11 @@ def run_ros2_rviz_headless_simulation(
         mu_fuse_history.append(float(mu_fuse_h[0]))
         slip_history.append(max_slip_step)
 
-        data.qpos[3] = np.clip(data.qpos[3] + (a_by0 / 9.81) * 0.08, -0.22, 0.22)
-        data.qpos[4] = np.clip(data.qpos[4] - (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+        # qpos[3] = slosh_x (+a_bx0), qpos[4] = slosh_y (-a_by0) theo quy ước slosh3.xml
+        data.qpos[3] = np.clip(data.qpos[3] + (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+        data.qpos[4] = np.clip(data.qpos[4] - (a_by0 / 9.81) * 0.08, -0.22, 0.22)
 
-        for _ in range(10):
+        for _ in range(n_substeps):
             mujoco.mj_step(model, data)
 
         sim_time += nmpc_dt
@@ -1645,19 +1647,20 @@ def run_ros2_rviz_headless_simulation(
         else:
             status_plain = "Bám quỹ đạo A* + Quét 180 tia LiDAR"
 
-        # Tính toán phản lực sóng sánh chất lỏng và tải pháp tuyến 4 bánh xe
-        th_x_deg = math.degrees(float(data.qpos[3]) + 0.35 * (a_by0 / 9.81))
-        th_y_deg = math.degrees(float(data.qpos[4]) - 0.35 * (a_bx0 / 9.81))
-        m_liquid = 1.20
-        F_slosh_x = m_liquid * (a_bx0 + 9.81 * math.sin(math.radians(th_y_deg)))
-        F_slosh_y = m_liquid * (a_by0 + 9.81 * math.sin(math.radians(th_x_deg)))
+        # Tính toán phản lực sóng sánh chất lỏng và tải pháp tuyến 4 bánh xe đúng trục & cao độ tâm áp lực
+        th_x_rad = float(data.qpos[3]) + 0.35 * (a_bx0 / 9.81)
+        th_y_rad = float(data.qpos[4]) - 0.35 * (a_by0 / 9.81)
+        th_x_deg = math.degrees(th_x_rad)
+        th_y_deg = math.degrees(th_y_rad)
+        F_slosh_x = M_1X * (a_bx0 - 9.81 * math.sin(th_x_rad))
+        F_slosh_y = M_1Y * (a_by0 + 9.81 * math.sin(th_y_rad))
         Fz_wheels, (M_pitch, M_roll) = compute_dynamic_normal_loads(
             m_total=7.25,
             a_body=[a_bx0, a_by0],
             f_slosh_body=[F_slosh_x, F_slosh_y],
-            phi_body=[math.radians(th_x_deg), math.radians(th_y_deg)],
+            phi_body=[th_x_rad, th_y_rad],
             z_com=0.0555,
-            z_slosh=(0.0768, 0.0768),
+            z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
             fz_min=0.889
         )
         fz_min_now = float(np.min(Fz_wheels))

@@ -52,7 +52,7 @@ from dfe_mpcc_amr_controller import DFEMPCCAMRController
 from iso8608_road_profile import ISO8608RoadProfile
 from conformal_checkpoint_eval import load_conformal_calibration_budget
 from mecanum_traction_dynamics import (
-    M_TOTAL, M_1X, M_1Y, L_P_X, L_P_Y,
+    M_TOTAL, M_1X, M_1Y, L_P_X, L_P_Y, Z_SLOSH_X, Z_SLOSH_Y,
     compute_dynamic_normal_loads,
     allocate_wheel_forces_clamped,
     evaluate_traction_and_slip,
@@ -530,7 +530,7 @@ def run_closed_loop_episode(
                 f_slosh_body=[F_slosh_bx_dyn, F_slosh_by_dyn],
                 phi_body=[phi_x_meas, phi_y_meas],
                 z_com=0.0555,
-                z_slosh=(0.0768, 0.0768),
+                z_slosh=(Z_SLOSH_X, Z_SLOSH_Y),
                 fz_min=0.889,
             )
             Fz_true = np.maximum(0.889, Fz_dyn + dfz_iso_now)
@@ -558,6 +558,8 @@ def run_closed_loop_episode(
             a_th0 = f_chassis_act_body[2] / IZ_BASE
             a_wx_true = c_th0 * a_bx0 - s_th0 * a_by0
             a_wy_true = s_th0 * a_bx0 + c_th0 * a_by0
+            if dashing_gate_idx >= 0:
+                a_act = np.array([a_wx_true, a_wy_true, a_th0], dtype=float)
 
             data.qvel[0] = v_meas[0] + a_wx_true * nmpc_dt
             data.qvel[1] = v_meas[1] + a_wy_true * nmpc_dt
@@ -577,8 +579,9 @@ def run_closed_loop_episode(
             max_slip_overall = max_slip_step
         mu_fuse_history.append(float(mu_fuse_h[0]))
 
-        data.qpos[3] = np.clip(data.qpos[3] + (a_by0 / 9.81) * 0.08, -0.22, 0.22)
-        data.qpos[4] = np.clip(data.qpos[4] - (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+        # qpos[3] = slosh_x (+a_bx0), qpos[4] = slosh_y (-a_by0) theo quy ước slosh3.xml
+        data.qpos[3] = np.clip(data.qpos[3] + (a_bx0 / 9.81) * 0.08, -0.22, 0.22)
+        data.qpos[4] = np.clip(data.qpos[4] - (a_by0 / 9.81) * 0.08, -0.22, 0.22)
 
         for _ in range(n_substeps):
             mujoco.mj_step(model, data)
