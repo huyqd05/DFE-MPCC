@@ -53,6 +53,7 @@ from mecanum_traction_dynamics import (
     scale_wrench_to_zonotope,
 )
 from robot_model_amr_casadi import IZ_BASE, L_X, L_Y, hd_x, hd_y, omega_x, omega_y
+from dual_layer_friction_estimator import DualLayerFrictionEstimator
 from semantic_friction_estimator import (
     SemanticFloorMap,
     SemanticFrictionEstimator,
@@ -102,10 +103,17 @@ class DfeMpccPipeline:
         x_bounds: tuple = (-3.6, 3.6),
         y_bounds: tuple = (-3.6, 3.6),
         waypoints=None,
+        friction_mode: str = "semantic",
+        mu_env_range: tuple = None,
+        mu_hard_min: float = 0.05,
     ):
+        if friction_mode not in ("semantic", "dual_layer"):
+            raise ValueError(f"friction_mode không hợp lệ: '{friction_mode}'")
         self.dt = float(dt)
         self.mu_default = float(mu_default)
         self.map_name = str(map_name)
+        self.friction_mode = str(friction_mode)
+        self._sim_time = 0.0
 
         cal_budget = load_conformal_calibration_budget()
         self.q_eta_m = float(cal_budget.get("recommended_q_eta_m", 0.004226))
@@ -121,6 +129,19 @@ class DfeMpccPipeline:
             cal_mu_path if os.path.exists(cal_mu_path) else None,
             semantic_map=sem_map,
         )
+        if self.friction_mode == "dual_layer":
+            if mu_env_range is None:
+                env_low = max(0.08, self.mu_default - 0.06)
+                env_high = self.mu_default + 0.06
+            else:
+                env_low, env_high = float(mu_env_range[0]), float(mu_env_range[1])
+            self.dual_estimator = DualLayerFrictionEstimator(
+                mu_env_low=env_low,
+                mu_env_high=env_high,
+                mu_hard_min=float(mu_hard_min),
+            )
+        else:
+            self.dual_estimator = None
 
         self.controller = DFEMPCCAMRController(
             N=int(horizon_N),
@@ -150,13 +171,14 @@ class DfeMpccPipeline:
         init_wps = build_default_world_waypoints() if waypoints is None else waypoints
         self.set_waypoints(init_wps)
 
-    def set_waypoints(self, waypoints) -> float:
+    def set_waypoints(self, waypoints, keep_anomaly_map: bool = True) -> float:
         """Nạp quỹ đạo mới, tái dựng Ống vận tốc H124 + bản đồ ma sát Tầng 1 và đặt lại tiến độ."""
         wp_arr = np.asarray(waypoints, dtype=float)
         self.controller.set_path(wp_arr)
+        active_estimator = self.dual_estimator if self.friction_mode == "dual_layer" else self.sem_estimator
         self.tube_planner.build_offline_tube(
             wp_arr,
-            friction_estimator=self.sem_estimator,
+            friction_estimator=active_estimator,
             friction_mode="conformal_lcb",
             run_wcsph_check=False,
         )
@@ -166,6 +188,8 @@ class DfeMpccPipeline:
         mu_init = float(np.asarray(self.tube_planner.get_horizon_mu_plan([0.0])).ravel()[0])
         self.friction_observer.reset(mu_init=mu_init)
         self.friction_fusion.reset()
+        if self.dual_estimator is not None:
+            self.dual_estimator.reset(keep_anomaly_map=keep_anomaly_map)
         self.mu_rls_curr = mu_init
         self.bin_curr = 0
 
@@ -229,9 +253,19 @@ class DfeMpccPipeline:
         else:
             slips_obs = np.asarray(wheel_slips, dtype=float).reshape(4)
 
-        self.mu_rls_curr, _, self.bin_curr = self.friction_observer.update(
-            W_act_est_xy, W_cmd_prev_xy, slips_obs, float(np.sum(Fz_prev)), M_TOTAL
-        )
+        self._sim_time += self.dt
+        if self.friction_mode == "dual_layer" and self.dual_estimator is not None:
+            dl_out = self.dual_estimator.update_online(
+                q_arr[0], q_arr[1], th,
+                W_act_est_xy, W_cmd_prev_xy, slips_obs,
+                float(np.sum(Fz_prev)), M_TOTAL, t_now=self._sim_time,
+            )
+            self.mu_rls_curr = dl_out["mu_rls"]
+            self.bin_curr = dl_out["bin_idx"]
+        else:
+            self.mu_rls_curr, _, self.bin_curr = self.friction_observer.update(
+                W_act_est_xy, W_cmd_prev_xy, slips_obs, float(np.sum(Fz_prev)), M_TOTAL
+            )
 
         # 2. Ánh xạ cung đường MPC <-> Tube H124 & hợp nhất ma sát chân trời Tầng 1 + Tầng 2
         x_nmpc = np.zeros(12, dtype=float)
@@ -249,10 +283,21 @@ class DfeMpccPipeline:
             self.controller.path_length,
         )
         s_tube_h = self.controller.map_s_mpc_to_tube(s_vec_mpc)
-        mu_plan_h = self.tube_planner.get_horizon_mu_plan(s_tube_h)
-        mu_fuse_h = self.friction_fusion.fuse_horizon_mu(
-            mu_plan_h, s_tube_h, self.mu_rls_curr, self.bin_curr, s_curr=float(s_tube_h[0])
-        )
+        if self.friction_mode == "dual_layer" and self.dual_estimator is not None:
+            x_h = np.interp(s_tube_h, self.tube_planner.s_grid, self.tube_planner.x_grid)
+            y_h = np.interp(s_tube_h, self.tube_planner.s_grid, self.tube_planner.y_grid)
+            yaw_h = np.arctan2(
+                np.interp(s_tube_h, self.tube_planner.s_grid, np.sin(self.tube_planner.yaw_grid)),
+                np.interp(s_tube_h, self.tube_planner.s_grid, np.cos(self.tube_planner.yaw_grid)),
+            )
+            mu_fuse_h = self.dual_estimator.fuse_horizon_xy(
+                x_h, y_h, yaw_h, s_tube_h, t_now=self._sim_time, s_curr=float(s_tube_h[0])
+            )
+        else:
+            mu_plan_h = self.tube_planner.get_horizon_mu_plan(s_tube_h)
+            mu_fuse_h = self.friction_fusion.fuse_horizon_mu(
+                mu_plan_h, s_tube_h, self.mu_rls_curr, self.bin_curr, s_curr=float(s_tube_h[0])
+            )
         v_ub_h, v_lb_h = self.tube_planner.query_online_horizon_tube(
             s_tube_h, phi_arr, mu_online=mu_fuse_h
         )
@@ -341,14 +386,20 @@ class DfeMpccRos2Node(Node):
         self.declare_parameter('ipopt_max_iter', 12)
         self.declare_parameter('map_name', 'generic_dry')
         self.declare_parameter('mu_default', 0.35)
+        self.declare_parameter('friction_mode', 'semantic')
+        self.declare_parameter('mu_env_low', 0.28)
+        self.declare_parameter('mu_env_high', 0.42)
 
         n_hor = int(self.get_parameter('horizon_n').value)
         max_it = int(self.get_parameter('ipopt_max_iter').value)
         map_name = str(self.get_parameter('map_name').value)
         mu_def = float(self.get_parameter('mu_default').value)
+        f_mode = str(self.get_parameter('friction_mode').value)
+        env_low = float(self.get_parameter('mu_env_low').value)
+        env_high = float(self.get_parameter('mu_env_high').value)
 
         self.get_logger().info(
-            f"Khởi tạo DFE-MPCC ROS 2 Pipeline (N={n_hor}, max_iter={max_it}, map={map_name})..."
+            f"Khởi tạo DFE-MPCC ROS 2 Pipeline (N={n_hor}, max_iter={max_it}, map={map_name}, mode={f_mode})..."
         )
         self.pipeline = DfeMpccPipeline(
             horizon_N=n_hor,
@@ -356,6 +407,8 @@ class DfeMpccRos2Node(Node):
             ipopt_max_iter=max_it,
             mu_default=mu_def,
             map_name=map_name,
+            friction_mode=f_mode,
+            mu_env_range=(env_low, env_high),
         )
         self.controller = self.pipeline.controller
         self.get_logger().info(
